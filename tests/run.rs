@@ -935,3 +935,53 @@ fn f4_a_signal_ends_the_run_while_stderr_is_not_read() {
         "a command was left running"
     );
 }
+
+#[test]
+fn c14_fades_compaction_and_branch_lines_from_the_terminal() {
+    let b = place("c14");
+    let mut script = Vec::new();
+    for i in 1..=12 {
+        write(
+            &b.work.join(format!("big{i}.txt")),
+            &format!("{}\n", format!("big{i} ").repeat(500)),
+        );
+        script.push(json!({ "tool_calls": [{ "name": "Bash", "input": { "command": format!("cat big{i}.txt") } }], "usage": { "input_tokens": 100 * i } }));
+    }
+    write(&b.work.join("x.txt"), "BRANCH-SEEN\n");
+    script.extend([
+        json!({ "match": "big12", "tool_calls": [{ "id": "br", "name": "Branch", "input": { "task": "BRANCH-TASK: read x.txt" } }], "usage": { "input_tokens": 1300 } }),
+        json!({ "match": "BRANCH-TASK", "text": "branch text is not shown", "tool_calls": [{ "name": "Read", "input": { "file_path": "x.txt" } }] }),
+        json!({ "match": "BRANCH-SEEN", "text": "x says BRANCH-SEEN" }),
+        json!({ "match": "x says", "tool_calls": [{ "name": "Glob", "input": { "pattern": "*.none" } }], "usage": { "input_tokens": 2600 } }),
+        json!({ "tool_calls": [{ "name": "Glob", "input": { "pattern": "*.nothing" } }], "usage": { "input_tokens": 3500 } }),
+        json!({ "match": "Write a summary", "text": "SUMMARY-C14" }),
+        json!({ "match": "SUMMARY-C14", "text": "All done." }),
+    ]);
+    let fake = FakeModel::start(script, 0, None).unwrap();
+    let o = cmd(
+        &b,
+        &fake.url(),
+        &["--yes", "--context-tokens", "4000", "do the long job"],
+    )
+    .output()
+    .unwrap();
+    let (stdout, stderr) = out(&o);
+    assert_eq!(o.status.code(), Some(0), "{stderr}");
+    assert!(stdout.ends_with("All done.\n"), "{stdout}");
+    assert!(!stdout.contains("branch text is not shown"));
+    assert!(stderr.contains("> Branch BRANCH-TASK: read x.txt\n  > Read x.txt\n    Read x.txt: 1 lines\n  Branch BRANCH-TASK: read x.txt: 1 lines\n"), "{stderr}");
+    let bodies: Vec<String> = fake.requests().iter().map(|r| r.body.clone()).collect();
+    let first_body: Value = serde_json::from_str(&bodies[0]).unwrap();
+    assert_eq!(first_body["tools"].as_array().unwrap().len(), 8);
+    assert!(
+        bodies
+            .iter()
+            .any(|x| x.contains("[Faded to save context: Bash cat big1.txt")),
+        "a fade"
+    );
+    assert!(
+        bodies.iter().any(|x| x.contains("Write a summary")),
+        "a compaction"
+    );
+    assert!(bodies.last().unwrap().contains("This chat was compacted."));
+}

@@ -79,6 +79,7 @@ async fn run(cx: &Cx, input: &Value) -> Result<Out, String> {
         background: false,
         stop_requested: false,
         stopped_by_tool: false,
+        announced: false,
         done: done.clone(),
     });
     let (host, session, tid) = (t.host.clone(), t.session.clone(), id.clone());
@@ -213,8 +214,9 @@ fn exited(host: &Host, session: &Session, id: &str, code: i32) {
             task.id,
             task.output.display()
         );
+        let id = task.id.clone();
         if let Some(ctl) = st.turn.as_mut() {
-            ctl.notes.push(note);
+            ctl.notes.push((id, note));
         }
     }
 }

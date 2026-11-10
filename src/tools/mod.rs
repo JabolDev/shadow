@@ -1,5 +1,6 @@
-//! The seven native tools: their definitions, the dispatcher, and what every
+//! The eight native tools: their definitions, the dispatcher, and what every
 //! tool shares — paths, arguments, and bounded results with overflow files.
+//! Branch runs the loop itself (`turn`); here is only its definition.
 
 mod bash;
 mod edit;
@@ -7,6 +8,7 @@ mod read;
 mod search;
 
 pub use bash::{StopOutcome, kill_all, stop_task};
+pub use read::UNCHANGED_SINCE;
 
 use crate::turn::Turn;
 use serde_json::{Value, json};
@@ -16,9 +18,11 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 /// The native tools, in the order they are offered.
-pub const NATIVE: [&str; 7] = ["Read", "Write", "Edit", "Bash", "TaskStop", "Grep", "Glob"];
+pub const NATIVE: [&str; 8] = [
+    "Read", "Write", "Edit", "Bash", "TaskStop", "Grep", "Glob", "Branch",
+];
 
-/// The seven definitions, as sent to the model.
+/// The eight definitions, as sent to the model.
 pub fn definitions() -> Vec<Value> {
     let string = |d: &str| json!({ "type": "string", "description": d });
     let edit_pair = json!({
@@ -94,6 +98,11 @@ pub fn definitions() -> Vec<Value> {
                 "pattern": string("The glob pattern"),
                 "path": string("The folder to search in (default: the working folder)"),
             }), &["pattern"]),
+        }),
+        json!({
+            "name": "Branch",
+            "description": "Run a task on a copy of everything seen so far in this conversation and get back only its final answer. Use it to look something up or try something out without filling this conversation with the steps. A branch cannot change files: Edit, Write and Branch are not available in it. Several branches in one message run at the same time.",
+            "input_schema": schema(json!({ "task": string("What to do or find out, and what to answer") }), &["task"]),
         }),
     ]
 }
@@ -171,23 +180,27 @@ impl Cx {
 
     /// `<scratch>/<call id>.txt`
     pub fn overflow_path(&self) -> PathBuf {
-        let id: String = self
-            .call_id
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        self.turn.session.scratch().join(format!("{id}.txt"))
+        overflow_file(&self.turn.session.scratch(), &self.call_id)
     }
 
     pub fn bound(&self, text: &str) -> io::Result<Bounded> {
         bound(text, self.cap(), &self.overflow_path())
     }
+}
+
+/// `<scratch>/<call id>.txt`, the call id made safe for a file name.
+pub fn overflow_file(scratch: &Path, call_id: &str) -> PathBuf {
+    let id: String = call_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    scratch.join(format!("{id}.txt"))
 }
 
 pub async fn run(turn: &Arc<Turn>, call_id: &str, name: &str, input: &Value) -> Out {

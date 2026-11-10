@@ -2,16 +2,20 @@
 //! One JSON object per line:
 //!
 //!   {"kind":"message","message":{…}}     a message exactly as sent / received
-//!   {"kind":"compaction","message":{…}}  the summary message; the context restarts from it
+//!   {"kind":"compaction","message":{…},"ledger"?:{…}}  the summary message; the context restarts from it
 //!   {"kind":"cursor","cursor":"…"}       the host's cursor for a turn
-//!   {"kind":"model_call","at":<ms>}      time of a completed model call
+//!   {"kind":"model_call","at":<ms>,"tokens"?:n}  a completed model call and the context size it reported
+//!   {"kind":"fade","stubs":{"<call id>":"<stub>",…}}  those tool results are sent as their stub from here on
 //!
 //! Messages are kept as their JSON text, so a request rebuilt from the log
-//! repeats earlier requests byte for byte.
+//! repeats earlier requests byte for byte. A fade rewrites the messages it
+//! names in the same way at every load, so the rebuilt context is the same
+//! bytes after a restart.
 
 use serde::Deserialize;
 use serde_json::value::RawValue;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -27,6 +31,14 @@ pub struct Wire {
     pub exists: bool,
     /// Assistant messages in the context (the chat's step count).
     pub assistant_count: u64,
+    /// Calls whose results are faded (since the last compaction).
+    pub faded: HashSet<String>,
+    /// The ledger of the last compaction.
+    pub ledger: Option<Value>,
+    /// Characters of the context's messages.
+    chars: usize,
+    /// Tokens the last model call reported, and `chars` at that moment.
+    report: Option<(u64, usize)>,
     /// Bytes of complete lines in the file; a torn last line lies past it.
     good_len: u64,
     /// Lines not yet written (repairs from loading, new entries).
@@ -41,6 +53,9 @@ struct Entry<'a> {
     message: Option<&'a RawValue>,
     cursor: Option<String>,
     at: Option<u64>,
+    tokens: Option<u64>,
+    stubs: Option<Map<String, Value>>,
+    ledger: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -65,6 +80,10 @@ impl Wire {
             last_model_call_at: None,
             exists: bytes.is_some(),
             assistant_count: 0,
+            faded: HashSet::new(),
+            ledger: None,
+            chars: 0,
+            report: None,
             good_len: 0,
             pending: Vec::new(),
             file: None,
@@ -87,13 +106,13 @@ impl Wire {
             })?;
             match (e.kind, e.message) {
                 ("message", Some(m)) => w.add(m.get().to_string()),
-                ("compaction", Some(m)) => {
-                    w.messages.clear();
-                    w.assistant_count = 0;
-                    w.add(m.get().to_string());
-                }
+                ("compaction", Some(m)) => w.restart(m.get().to_string(), e.ledger),
                 ("cursor", _) => w.cursor = e.cursor,
-                ("model_call", _) => w.last_model_call_at = e.at.or(w.last_model_call_at),
+                ("model_call", _) => {
+                    w.last_model_call_at = e.at.or(w.last_model_call_at);
+                    w.report = e.tokens.map(|t| (t, w.chars));
+                }
+                ("fade", _) => w.fade(&e.stubs.unwrap_or_default()),
                 (kind, _) => eprintln!(
                     "shadow: {} line {line_no}: unknown kind {kind:?}",
                     path.display()
@@ -112,7 +131,66 @@ impl Wire {
         if serde_json::from_str::<Head>(&text).is_ok_and(|h| h.role == "assistant") {
             self.assistant_count += 1;
         }
+        self.chars += text.chars().count();
         self.messages.push(text);
+    }
+
+    /// A compaction: the context restarts from the summary message.
+    fn restart(&mut self, text: String, ledger: Option<Value>) {
+        self.messages.clear();
+        self.assistant_count = 0;
+        self.faded.clear();
+        self.chars = 0;
+        self.report = None;
+        self.ledger = ledger;
+        self.add(text);
+    }
+
+    /// Sends the named tool results as their stubs from now on.
+    fn fade(&mut self, stubs: &Map<String, Value>) {
+        for m in self.messages.iter_mut() {
+            if !m.contains("\"tool_result\"") {
+                continue;
+            }
+            let Ok(mut v) = serde_json::from_str::<Value>(m) else {
+                continue;
+            };
+            let mut changed = false;
+            for b in v
+                .get_mut("content")
+                .and_then(Value::as_array_mut)
+                .into_iter()
+                .flatten()
+            {
+                let stub = b
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .and_then(|id| stubs.get(id));
+                if let (Some(stub), Some("tool_result")) =
+                    (stub.cloned(), b.get("type").and_then(Value::as_str))
+                {
+                    b["content"] = json!([{ "type": "text", "text": stub }]);
+                    changed = true;
+                }
+            }
+            if changed {
+                let text = v.to_string();
+                self.chars = self.chars + text.chars().count() - m.chars().count();
+                *m = text;
+            }
+        }
+        self.faded.extend(stubs.keys().cloned());
+    }
+
+    /// The context's size in tokens: what the last model call reported, plus
+    /// (or minus) the characters changed since then at 4 per token.
+    pub fn size(&self) -> u64 {
+        match self.report {
+            Some((tokens, at)) => {
+                (tokens as i64 + (self.chars as i64 - at as i64) / 4).max(0) as u64
+            }
+            None => (self.chars / 4) as u64,
+        }
     }
 
     fn line(&mut self, line: String) {
@@ -126,12 +204,21 @@ impl Wire {
         self.add(text);
     }
 
-    pub fn push_compaction(&mut self, msg: &Value) {
+    pub fn push_compaction(&mut self, msg: &Value, ledger: Option<Value>) {
         let text = msg.to_string();
-        self.line(format!(r#"{{"kind":"compaction","message":{text}}}"#));
-        self.messages.clear();
-        self.assistant_count = 0;
-        self.add(text);
+        match &ledger {
+            Some(l) => self.line(format!(
+                r#"{{"kind":"compaction","message":{text},"ledger":{l}}}"#
+            )),
+            None => self.line(format!(r#"{{"kind":"compaction","message":{text}}}"#)),
+        }
+        self.restart(text, ledger);
+    }
+
+    /// One fade marker: `stubs` maps call ids to the line sent instead.
+    pub fn push_fade(&mut self, stubs: Map<String, Value>) {
+        self.line(json!({ "kind": "fade", "stubs": stubs }).to_string());
+        self.fade(&stubs);
     }
 
     pub fn push_cursor(&mut self, cursor: &str) {
@@ -139,9 +226,15 @@ impl Wire {
         self.cursor = Some(cursor.to_string());
     }
 
-    pub fn push_model_call(&mut self, at: u64) {
-        self.line(json!({ "kind": "model_call", "at": at }).to_string());
+    /// A model call that reported `tokens` for the context up to its message.
+    pub fn push_model_call(&mut self, at: u64, tokens: Option<u64>) {
+        let mut line = json!({ "kind": "model_call", "at": at });
+        if let Some(t) = tokens {
+            line["tokens"] = t.into();
+        }
+        self.line(line.to_string());
         self.last_model_call_at = Some(at);
+        self.report = tokens.map(|t| (t, self.chars));
     }
 
     /// Writes the pending lines and syncs them to disk.

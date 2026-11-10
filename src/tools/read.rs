@@ -8,6 +8,8 @@ use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
 
+/// The start of the one-line answer for lines that are already above.
+pub const UNCHANGED_SINCE: &str = "Unchanged since step ";
 const DEFAULT_LIMIT: usize = 2000;
 const MAX_LINE_CHARS: usize = 2000;
 /// Base64 of this many bytes is 5 MB, the usual image limit of model APIs.
@@ -98,7 +100,7 @@ fn run(cx: &Cx, input: &Value) -> Result<Out, String> {
     let (a, b) = (offset, offset + lines.len() - 1);
     if let Some(n) = cx.turn.versions().unchanged_since(&key, &hash, a, b, step) {
         return Ok(Out::text(format!(
-            "Unchanged since step {n} (lines {a}–{b} are above)."
+            "{UNCHANGED_SINCE}{n} (lines {a}–{b} are above)."
         )));
     }
     let body: Vec<String> = lines

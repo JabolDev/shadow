@@ -1,7 +1,10 @@
 //! A turn: the loop of Appendix B. One step is one model call plus its tool
 //! calls; the turn ends when the model's message has no tool call (done), on
-//! Stop, at max_steps, or on an error retries cannot fix.
+//! Stop, at max_steps, or on an error retries cannot fix. A branch runs the
+//! same loop on a copy of the context and returns only its final text.
 
+use crate::compact;
+use crate::context::{self, Repeats};
 use crate::model::{self, Endpoint, Outcome};
 use crate::rpc::{Host, Reply, error_text};
 use crate::session::{Inbox, Session, Steer, TurnCtl, now_ms, random_id};
@@ -10,9 +13,11 @@ use crate::versions::Versions;
 use crate::wire::{self, Wire, error_result};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::future::Future;
 use std::io;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
@@ -20,8 +25,14 @@ use tokio::sync::{oneshot, watch};
 
 pub const STOPPED: &str = "Stopped by the user.";
 const NOT_RUN: &str = "Not run: a message from the user arrived first. Read it, then decide again.";
+const NOT_FINISHED: &str = "Not finished: a message from the user arrived first.";
+const NOT_IN_BRANCH: &str = "Not available in a branch.";
+const BRANCH_NOTE: &str = "You are a branch of the conversation above. Only your final answer goes back to it, and you cannot change files here (Edit, Write and Branch are not available).";
 const RESERVED: [&str; 5] = ["model", "system", "tools", "messages", "stream"];
+/// Test only: the prompt cache's lifetime in ms, instead of 5 minutes or 1 hour.
+const TEST_CACHE_TTL: &str = "SHADOW_TEST_CACHE_TTL_MS";
 
+#[derive(Clone)]
 pub struct Limits {
     pub max_steps: u64,
     pub bash_wait_ms: u64,
@@ -29,6 +40,7 @@ pub struct Limits {
     pub retry_max: u32,
 }
 
+#[derive(Clone)]
 pub struct HostTool {
     pub name: String,
     pub parallel: bool,
@@ -54,9 +66,13 @@ pub struct Turn {
     native: Vec<&'static str>,
     host_tools: Vec<HostTool>,
     cache: Option<Value>,
+    ctx: context::Settings,
+    /// In a branch: the id of its Branch call (sent as `branch`).
+    branch: Option<String>,
     versions: OnceLock<Mutex<Versions>>,
     steps: AtomicU64,
-    usage: Mutex<Map<String, Value>>,
+    /// The turn's usage; its branches add theirs.
+    usage: Arc<Mutex<Map<String, Value>>>,
     cursor: Mutex<Option<String>>,
     /// Ids of steers taken from the queue whose `steer.delivered` is not sent yet.
     taken: Mutex<Vec<Value>>,
@@ -84,6 +100,8 @@ struct Params {
     #[serde(default)]
     limits: LimitsSpec,
     cache: Option<CacheSpec>,
+    /// `true` turns auto-compaction on; anything else leaves it off.
+    auto_compact: Option<Value>,
     #[serde(default)]
     catchup: Vec<Value>,
     cursor: Option<String>,
@@ -97,6 +115,8 @@ struct HostToolSpec {
     input_schema: Map<String, Value>,
     #[serde(default)]
     parallel: bool,
+    #[serde(default)]
+    keep_latest: bool,
 }
 
 #[derive(Deserialize)]
@@ -121,6 +141,7 @@ struct LimitsSpec {
     bash_wait_ms: Option<u64>,
     result_cap_chars: Option<usize>,
     retry_max: Option<u32>,
+    context_tokens: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -165,6 +186,7 @@ pub fn start(
         .filter(|d| native.contains(&d["name"].as_str().unwrap_or("")))
         .collect();
     let mut host_tools = Vec::new();
+    let mut keep = Vec::new();
     for h in p.host_tools {
         if h.name.is_empty()
             || native.contains(&h.name.as_str())
@@ -182,6 +204,9 @@ pub fn start(
         }
         def.insert("input_schema".into(), Value::Object(h.input_schema));
         defs.push(Value::Object(def));
+        if h.keep_latest {
+            keep.push(h.name.clone());
+        }
         host_tools.push(HostTool {
             name: h.name,
             parallel: h.parallel,
@@ -221,11 +246,27 @@ pub fn start(
         result_cap_chars: l.result_cap_chars.unwrap_or(30_000),
         retry_max: l.retry_max.unwrap_or(6),
     };
-    if limits.max_steps == 0 || limits.result_cap_chars < 200 {
+    if limits.max_steps == 0 || limits.result_cap_chars < 200 || l.context_tokens == Some(0) {
         return Err(bad(
-            "limits: max_steps is at least 1 and result_cap_chars at least 200".into(),
+            "limits: max_steps and context_tokens are at least 1, result_cap_chars at least 200"
+                .into(),
         ));
     }
+    let lifetime = match cache.as_ref().map(|c| c.get("ttl")) {
+        None => None,
+        Some(Some(t)) if t == "1h" => Some(3_600_000),
+        Some(_) => Some(300_000),
+    };
+    // Read only when set (tests).
+    let test_ttl = std::env::var(TEST_CACHE_TTL)
+        .ok()
+        .and_then(|v| v.parse().ok());
+    let ctx = context::Settings {
+        window: l.context_tokens,
+        auto_compact: p.auto_compact == Some(Value::Bool(true)),
+        cache_ms: lifetime.map(|ms| test_ttl.unwrap_or(ms)),
+        keep,
+    };
 
     let id = random_id();
     let (stop_tx, stop) = watch::channel(false);
@@ -247,6 +288,8 @@ pub fn start(
             notes: Vec::new(),
         });
         st.last_tools = Some(tools.clone());
+        st.last_keep = ctx.keep.clone();
+        st.last_cap = Some(limits.result_cap_chars);
     }
     let turn = Turn {
         host: host.clone(),
@@ -266,9 +309,11 @@ pub fn start(
         native,
         host_tools,
         cache,
+        ctx,
+        branch: None,
         versions: OnceLock::new(),
         steps: AtomicU64::new(0),
-        usage: Mutex::new(Map::new()),
+        usage: Arc::default(),
         cursor: Mutex::new(None),
         taken: Mutex::new(Vec::new()),
     };
@@ -321,10 +366,10 @@ impl End {
 }
 
 #[derive(Clone)]
-struct Call {
-    id: String,
-    name: String,
-    input: Value,
+pub struct Call {
+    pub id: String,
+    pub name: String,
+    pub input: Value,
 }
 
 impl Call {
@@ -336,48 +381,38 @@ impl Call {
 /// The turn's steps. Ok(None): the turn already sent `turn.end` (done).
 async fn drive(t: &Arc<Turn>, start: Start) -> io::Result<Option<End>> {
     let mut wire = Wire::load(&t.session.wire_path())?;
+    let now = now_ms();
+    let mut pace = Pace::default();
+    // Cold wake: the cache is gone anyway, so every candidate fades now; the
+    // 60% fade waits until the context was under 60% again.
+    if t.ctx.cold(wire.last_model_call_at, now) {
+        let f = context::fade(&wire, 0, &t.cwd, &t.session.scratch(), &t.ctx.keep, None);
+        pace.under_fade = t.ctx.share(60).is_none_or(|at| f.size < at);
+        t.apply_fade(&mut wire, f);
+    }
     for m in &start.catchup {
         wire.push_message(m);
     }
     if let Some(c) = &start.cursor {
         wire.push_cursor(c);
     }
-    wire.push_message(&json!({ "role": "user", "content": start.input }));
+    let mut input = start.input;
+    let changed = t.versions().changed_outside();
+    if let Some(d) = context::delta(changed, &t.session, wire.last_model_call_at, now) {
+        input.insert(0, d);
+    }
+    wire.push_message(&json!({ "role": "user", "content": input }));
     wire.commit()?;
+    t.save_versions();
     *lock(&t.cursor) = wire.cursor.clone();
     t.chat_step.store(wire.assistant_count, Ordering::Relaxed);
-    let mut stop = t.stop.clone();
     loop {
         if t.stopped() {
             return Ok(Some(End::new("stopped")));
         }
         let step = t.steps.fetch_add(1, Ordering::Relaxed) + 1;
         t.emit("step.start", json!({ "step": step }));
-        let body = model::body(
-            &t.model,
-            Some(&t.system),
-            &t.tools,
-            &wire.messages,
-            &t.request,
-            t.cache.as_ref(),
-        );
-        let mut on_event = |ev: &Value| t.emit("model.event", json!({ "step": step, "event": ev }));
-        let mut on_retry = |attempt: u32, wait_ms: u64, status: Option<u16>| {
-            t.emit(
-                "retry",
-                json!({ "step": step, "attempt": attempt, "wait_ms": wait_ms, "status": status }),
-            )
-        };
-        let reply = match model::call(
-            &t.endpoint,
-            &body,
-            t.limits.retry_max,
-            &mut stop,
-            &mut on_event,
-            &mut on_retry,
-        )
-        .await
-        {
+        let reply = match model_step(t, step, &wire.messages).await {
             Outcome::Done(r) => r,
             Outcome::Failed(e) => return Ok(Some(End::error(e))),
             Outcome::Stopped(partial) => {
@@ -399,57 +434,300 @@ async fn drive(t: &Arc<Turn>, start: Start) -> io::Result<Option<End>> {
             }
         };
         t.add_usage(&reply.usage);
-        let calls: Vec<Call> = wire::tool_uses(&reply.message)
-            .map(|b| Call {
-                id: b["id"].as_str().unwrap_or("").into(),
-                name: b["name"].as_str().unwrap_or("").into(),
-                input: b["input"].clone(),
-            })
-            .collect();
+        let calls = calls_of(&reply.message);
         let empty = reply.message["content"]
             .as_array()
             .is_none_or(Vec::is_empty);
-        wire.push_model_call(now_ms());
         if !empty {
             wire.push_message(&reply.message);
         }
+        wire.push_model_call(now_ms(), reported(&reply.usage));
         wire.commit()?;
         t.chat_step.store(wire.assistant_count, Ordering::Relaxed);
         t.emit("message.end", json!({ "step": step, "message": reply.message, "usage": reply.usage, "stop_reason": reply.stop_reason }));
 
         if calls.is_empty() {
+            pace.repeats
+                .apply(wire.assistant_count, &[], &mut [], &wire.faded);
             let Some(inbox) = t.done_or_continue(step < t.limits.max_steps) else {
                 return Ok(None);
             };
-            wire.push_message(&json!({ "role": "user", "content": inbox.blocks() }));
-            wire.commit()?;
-            t.delivered(&inbox);
+            boundary(t, &mut wire, Vec::new(), inbox, &mut pace).await?;
             continue;
         }
-        let mut content = run_batch(t, step, calls).await;
-        let stopped = t.stopped();
-        let inbox = if stopped {
-            Inbox::default()
-        } else {
-            t.take_inbox()
-        };
-        content.extend(inbox.blocks());
-        wire.push_message(&json!({ "role": "user", "content": content }));
-        wire.commit()?;
-        t.save_versions();
-        t.delivered(&inbox);
-        if stopped {
+        // A branch starts from the messages before this step.
+        let before = &wire.messages[..wire.messages.len() - 1];
+        let prefix = calls
+            .iter()
+            .any(|c| c.name == "Branch")
+            .then(|| Arc::new(before.to_vec()));
+        let mut content = run_batch(t, step, &calls, prefix).await;
+        pace.repeats
+            .apply(wire.assistant_count, &calls, &mut content, &wire.faded);
+        if t.stopped() {
+            wire.push_message(&json!({ "role": "user", "content": content }));
+            wire.commit()?;
+            t.save_versions();
             return Ok(Some(End::new("stopped")));
         }
+        let inbox = t.take_inbox();
+        boundary(t, &mut wire, content, inbox, &mut pace).await?;
         if step >= t.limits.max_steps {
             return Ok(Some(End::new("max_steps")));
         }
     }
 }
 
+/// What the loop remembers between step boundaries.
+struct Pace {
+    repeats: Repeats,
+    /// Auto-compaction failed in this turn: it is not tried again.
+    compact_failed: bool,
+    /// The context was under 60% at the last boundary (or the turn's start).
+    under_fade: bool,
+}
+
+impl Default for Pace {
+    fn default() -> Pace {
+        Pace {
+            repeats: Repeats::default(),
+            compact_failed: false,
+            under_fade: true,
+        }
+    }
+}
+
+/// A step boundary: the step's results, then waiting notes and steers, go
+/// into one user message. With a window: at 85% (and `auto_compact`) the
+/// chat is compacted instead; at 60% old results fade in one batch down to
+/// 40%; the gauge line follows the results when the context crossed 50, 75
+/// or 90%.
+async fn boundary(
+    t: &Arc<Turn>,
+    wire: &mut Wire,
+    results: Vec<Value>,
+    inbox: Inbox,
+    pace: &mut Pace,
+) -> io::Result<()> {
+    let user = |blocks: &[Value]| json!({ "role": "user", "content": blocks });
+    let n = results.len();
+    let mut content = results;
+    content.extend(inbox.blocks());
+    let extra = user(&content).to_string().chars().count() as u64 / 4;
+    let size = wire.size() + extra;
+    let over = |pct| t.ctx.share(pct).is_some_and(|at| size >= at);
+    if t.ctx.auto_compact && !pace.compact_failed && over(85) {
+        let mut messages = wire.messages.clone();
+        if n > 0 {
+            messages.push(user(&content[..n]).to_string());
+        }
+        if let Some(summary) = auto_compact(t, messages).await {
+            if n > 0 {
+                wire.push_message(&user(&content[..n]));
+            }
+            let cap = t.limits.result_cap_chars;
+            compact::push(wire, &summary, &t.session, &t.ctx.keep, cap);
+            // Steers and notes come after the summary, word for word.
+            if n < content.len() {
+                wire.push_message(&user(&content[n..]));
+            }
+            wire.commit()?;
+            t.emit("compaction", json!({ "state": "done" }));
+            t.versions().clear_shown();
+            t.save_versions();
+            t.delivered(&inbox);
+            t.chat_step.store(wire.assistant_count, Ordering::Relaxed);
+            *pace = Pace::default();
+            return Ok(());
+        }
+        // The log is unchanged; the turn goes on and does not try again.
+        pace.compact_failed = true;
+    }
+    let mut fade = None;
+    if pace.under_fade && over(60) {
+        let f = context::fade(
+            wire,
+            extra,
+            &t.cwd,
+            &t.session.scratch(),
+            &t.ctx.keep,
+            t.ctx.share(40),
+        );
+        fade = Some(f);
+    }
+    let after = fade.as_ref().map_or(size, |f| f.size);
+    pace.under_fade = t.ctx.share(60).is_none_or(|at| after < at);
+    if let Some(line) = t
+        .ctx
+        .window
+        .and_then(|w| context::gauge(&wire.messages, after, w))
+    {
+        content.insert(n, json!({ "type": "text", "text": line }));
+    }
+    wire.push_message(&user(&content));
+    if let Some(f) = fade {
+        t.apply_fade(wire, f);
+    }
+    wire.commit()?;
+    t.save_versions();
+    t.delivered(&inbox);
+    Ok(())
+}
+
+/// The turn's own compaction call (as `session.compact` sends it, with the
+/// turn's model, endpoint, request, system and tools). None when it failed.
+async fn auto_compact(t: &Turn, messages: Vec<String>) -> Option<String> {
+    t.emit("compaction", json!({ "state": "start" }));
+    let ask = compact::Ask {
+        model: &t.model,
+        system: Some(&t.system),
+        tools: &t.tools,
+        request: &t.request,
+        cache: t.cache.as_ref(),
+        endpoint: &t.endpoint,
+        retry_max: t.limits.retry_max,
+    };
+    let mut stop = t.stop.clone();
+    match compact::summary(&ask, messages, None, &mut stop).await {
+        Ok((summary, usage)) => {
+            t.add_usage(&usage);
+            Some(summary)
+        }
+        Err(e) => {
+            eprintln!("shadow: auto-compaction of {}: {e}", t.session.id);
+            t.emit("compaction", json!({ "state": "failed" }));
+            None
+        }
+    }
+}
+
+/// The tokens a model call reported for the context up to its message.
+fn reported(usage: &Value) -> Option<u64> {
+    let keys = [
+        "input_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "output_tokens",
+    ];
+    let n: Vec<u64> = keys.iter().filter_map(|k| usage[k].as_u64()).collect();
+    (!n.is_empty()).then(|| n.iter().sum())
+}
+
+fn calls_of(message: &Value) -> Vec<Call> {
+    wire::tool_uses(message)
+        .map(|b| Call {
+            id: b["id"].as_str().unwrap_or("").into(),
+            name: b["name"].as_str().unwrap_or("").into(),
+            input: b["input"].clone(),
+        })
+        .collect()
+}
+
+/// One model call of a turn or a branch, with its notifications.
+async fn model_step(t: &Turn, step: u64, messages: &[String]) -> Outcome {
+    let body = model::body(
+        &t.model,
+        Some(&t.system),
+        &t.tools,
+        messages,
+        &t.request,
+        t.cache.as_ref(),
+    );
+    let mut stop = t.stop.clone();
+    let mut on_event = |ev: &Value| t.emit("model.event", json!({ "step": step, "event": ev }));
+    let mut on_retry = |attempt: u32, wait_ms: u64, status: Option<u16>| {
+        t.emit(
+            "retry",
+            json!({ "step": step, "attempt": attempt, "wait_ms": wait_ms, "status": status }),
+        )
+    };
+    model::call(
+        &t.endpoint,
+        &body,
+        t.limits.retry_max,
+        &mut stop,
+        &mut on_event,
+        &mut on_retry,
+    )
+    .await
+}
+
+/// Branch: the task on a copy of the context before this step; only its
+/// final text comes back. A waiting steer ends it at once.
+async fn branch(
+    t: &Arc<Turn>,
+    call_id: &str,
+    input: &Value,
+    prefix: Arc<Vec<String>>,
+) -> tools::Out {
+    let task = match tools::req_str(input, "task") {
+        Ok(task) => task,
+        Err(e) => return tools::Out::error(e),
+    };
+    let b = Arc::new(t.branch_of(call_id));
+    let mut messages = prefix.to_vec();
+    let ask = json!([{ "type": "text", "text": task }, { "type": "text", "text": BRANCH_NOTE }]);
+    messages.push(json!({ "role": "user", "content": ask }).to_string());
+    let mut waiting = t.waiting.clone();
+    let end = tokio::select! {
+        biased;
+        r = branch_steps(&b, messages) => r,
+        Ok(_) = waiting.wait_for(|n| *n > 0) => Err(NOT_FINISHED.to_string()),
+    };
+    match end {
+        Ok(text) if text.trim().is_empty() => tools::Out::text("(The branch gave no answer.)"),
+        Ok(text) => {
+            let file = tools::overflow_file(&t.session.scratch(), call_id);
+            match tools::bound(&text, t.limits.result_cap_chars, &file) {
+                Ok(bounded) => tools::Out::bounded(bounded, false),
+                Err(e) => tools::Out::error(format!("Cannot write the overflow file: {e}")),
+            }
+        }
+        Err(e) => tools::Out::error(e),
+    }
+}
+
+/// A branch's loop: like the turn's, but nothing is logged, no steer or note
+/// is taken, and the model's first message without a tool call is the answer.
+async fn branch_steps(b: &Arc<Turn>, mut messages: Vec<String>) -> Result<String, String> {
+    let mut repeats = Repeats::default();
+    let none = HashSet::new();
+    for step in 1..=b.limits.max_steps {
+        b.steps.store(step, Ordering::Relaxed);
+        b.emit("step.start", json!({ "step": step }));
+        let reply = match model_step(b, step, &messages).await {
+            Outcome::Done(r) => r,
+            Outcome::Stopped(_) => return Err(STOPPED.into()),
+            Outcome::Failed(e) => return Err(format!("The branch failed: {}", error_text(&e))),
+        };
+        b.add_usage(&reply.usage);
+        b.emit("message.end", json!({ "step": step, "message": reply.message, "usage": reply.usage, "stop_reason": reply.stop_reason }));
+        let calls = calls_of(&reply.message);
+        if calls.is_empty() {
+            let text = reply.message["content"].as_array().into_iter().flatten();
+            let text: Vec<&str> = text.filter_map(|c| c["text"].as_str()).collect();
+            return Ok(text.join("\n"));
+        }
+        messages.push(reply.message.to_string());
+        let chat_step = b.chat_step.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut results = run_batch(b, step, &calls, None).await;
+        repeats.apply(chat_step, &calls, &mut results, &none);
+        messages.push(json!({ "role": "user", "content": results }).to_string());
+    }
+    Err(format!(
+        "Not finished: the branch used all its {} steps.",
+        b.limits.max_steps
+    ))
+}
+
 /// Runs one step's calls: neighbouring parallel calls at once, the rest
 /// alone, in call order. Results come back in call order.
-async fn run_batch(t: &Arc<Turn>, step: u64, calls: Vec<Call>) -> Vec<Value> {
+async fn run_batch(
+    t: &Arc<Turn>,
+    step: u64,
+    calls: &[Call],
+    prefix: Option<Arc<Vec<String>>>,
+) -> Vec<Value> {
     let mut out = Vec::with_capacity(calls.len());
     let mut i = 0;
     while i < calls.len() {
@@ -464,14 +742,15 @@ async fn run_batch(t: &Arc<Turn>, step: u64, calls: Vec<Call>) -> Vec<Value> {
             out.extend(group.iter().map(|c| error_result(&c.id, STOPPED)));
         } else if group.len() == 1 {
             let first = begin(t, step, &group[0]);
-            out.push(finish(t.clone(), step, group[0].clone(), first).await);
+            let call = group[0].clone();
+            out.push(finish(t.clone(), step, call, first, prefix.clone()).await);
         } else {
             // Every call's first request goes out in call order; then they run at once.
             let firsts: Vec<Pending> = group.iter().map(|c| begin(t, step, c)).collect();
             let running: Vec<_> = group
                 .iter()
                 .zip(firsts)
-                .map(|(c, p)| tokio::spawn(finish(t.clone(), step, c.clone(), p)))
+                .map(|(c, p)| tokio::spawn(finish(t.clone(), step, c.clone(), p, prefix.clone())))
                 .collect();
             for (h, c) in running.into_iter().zip(group) {
                 out.push(h.await.unwrap_or_else(|e| {
@@ -496,6 +775,9 @@ enum Pending {
 fn begin(t: &Turn, step: u64, c: &Call) -> Pending {
     let known =
         t.native.contains(&c.name.as_str()) || t.host_tools.iter().any(|h| h.name == c.name);
+    if known && t.branch.is_some() && matches!(c.name.as_str(), "Edit" | "Write" | "Branch") {
+        return Pending::Done(error_result(&c.id, NOT_IN_BRANCH));
+    }
     if known && !t.parallel(&c.name) && t.steer_waiting() {
         return Pending::Done(error_result(&c.id, NOT_RUN));
     }
@@ -512,7 +794,13 @@ fn begin(t: &Turn, step: u64, c: &Call) -> Pending {
     Pending::Check(t.ask("tool.check", json!({ "step": step, "call": c.json() })))
 }
 
-async fn finish(t: Arc<Turn>, step: u64, c: Call, first: Pending) -> Value {
+async fn finish(
+    t: Arc<Turn>,
+    step: u64,
+    c: Call,
+    first: Pending,
+    prefix: Option<Arc<Vec<String>>>,
+) -> Value {
     let check = match first {
         Pending::Done(v) => return v,
         Pending::Host(rx) => {
@@ -572,7 +860,7 @@ async fn finish(t: Arc<Turn>, step: u64, c: Call, first: Pending) -> Value {
     // Stop ends the wait for any tool; Bash, polled first, handles Stop itself.
     let out = tokio::select! {
         biased;
-        out = tools::run(&t, &c.id, &c.name, &input) => out,
+        out = run_call(&t, &c, &input, prefix) => out,
         _ = stop.wait_for(|s| *s) => tools::Out::error(STOPPED),
     };
     let meta = out.meta_json(started.elapsed().as_millis() as u64);
@@ -587,6 +875,19 @@ async fn finish(t: Arc<Turn>, step: u64, c: Call, first: Pending) -> Value {
         eprintln!("shadow: tool.end for {}: {}", c.id, error_text(&e));
     }
     result_block(&c.id, content, out.is_error)
+}
+
+/// A native tool; Branch runs a branch (boxed: a branch runs calls itself).
+fn run_call<'a>(
+    t: &'a Arc<Turn>,
+    c: &'a Call,
+    input: &'a Value,
+    prefix: Option<Arc<Vec<String>>>,
+) -> Pin<Box<dyn Future<Output = tools::Out> + Send + 'a>> {
+    match prefix {
+        Some(p) if c.name == "Branch" => Box::pin(branch(t, &c.id, input, p)),
+        _ => Box::pin(tools::run(t, &c.id, &c.name, input)),
+    }
 }
 
 fn result_block(id: &str, content: Value, is_error: bool) -> Value {
@@ -606,6 +907,9 @@ impl Turn {
         let mut m = Map::new();
         m.insert("session".into(), self.session.id.clone().into());
         m.insert("turn".into(), self.id.clone().into());
+        if let Some(b) = &self.branch {
+            m.insert("branch".into(), b.clone().into());
+        }
         if let Value::Object(e) = extra {
             m.extend(e);
         }
@@ -645,7 +949,7 @@ impl Turn {
     }
 
     fn parallel(&self, name: &str) -> bool {
-        (matches!(name, "Read" | "Grep" | "Glob") && self.native.contains(&name))
+        (matches!(name, "Read" | "Grep" | "Glob" | "Branch") && self.native.contains(&name))
             || self.host_tools.iter().any(|h| h.name == name && h.parallel)
     }
 
@@ -678,10 +982,64 @@ impl Turn {
     }
 
     fn delivered(&self, inbox: &Inbox) {
+        if !inbox.notes.is_empty() {
+            let mut st = self.session.lock();
+            let noted = |id: &String| inbox.notes.iter().any(|(n, _)| n == id);
+            for k in st.tasks.iter_mut().filter(|k| noted(&k.id)) {
+                k.announced = true;
+            }
+        }
         let mut taken = lock(&self.taken);
         for Steer { id, .. } in &inbox.steers {
             self.emit("steer.delivered", json!({ "id": id }));
             taken.retain(|t| t != id);
+        }
+    }
+
+    /// One fade marker (when anything fades); the faded Reads' lines are no
+    /// longer "above".
+    fn apply_fade(&self, wire: &mut Wire, f: context::Fade) {
+        if f.stubs.is_empty() {
+            return;
+        }
+        let mut v = self.versions();
+        for (path, step) in &f.reads {
+            v.forget(path, *step);
+        }
+        drop(v);
+        wire.push_fade(f.stubs);
+    }
+
+    /// A branch of this turn for the Branch call `call_id`: the same model,
+    /// endpoint, request, system and tools, its own steps and a copy of the
+    /// version table (never saved).
+    fn branch_of(&self, call_id: &str) -> Turn {
+        let versions = self.versions().clone();
+        Turn {
+            host: self.host.clone(),
+            session: self.session.clone(),
+            id: self.id.clone(),
+            cwd: self.cwd.clone(),
+            env: self.env.clone(),
+            limits: self.limits.clone(),
+            stop: self.stop.clone(),
+            waiting: self.waiting.clone(),
+            chat_step: AtomicU64::new(self.chat_step.load(Ordering::Relaxed).saturating_sub(1)),
+            model: self.model.clone(),
+            system: self.system.clone(),
+            request: self.request.clone(),
+            endpoint: self.endpoint.clone(),
+            tools: self.tools.clone(),
+            native: self.native.clone(),
+            host_tools: self.host_tools.clone(),
+            cache: self.cache.clone(),
+            ctx: self.ctx.clone(),
+            branch: Some(call_id.to_string()),
+            versions: OnceLock::from(Mutex::new(versions)),
+            steps: AtomicU64::new(0),
+            usage: self.usage.clone(),
+            cursor: Mutex::new(None),
+            taken: Mutex::new(Vec::new()),
         }
     }
 
