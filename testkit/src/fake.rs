@@ -46,6 +46,8 @@ pub struct FakeModel {
     record: Option<PathBuf>,
     count: Arc<AtomicUsize>,
     tls: Option<Arc<rustls::ServerConfig>>,
+    /// When set, each request's headers are saved there as 0001.json, …
+    record_headers: Arc<std::sync::OnceLock<PathBuf>>,
     /// The test CA's certificate (PEM) when serving HTTPS.
     pub ca_pem: Option<String>,
 }
@@ -121,6 +123,7 @@ impl FakeModel {
             count: Arc::default(),
             tls,
             ca_pem,
+            record_headers: Arc::default(),
         };
         let f = fake.clone();
         thread::spawn(move || {
@@ -140,6 +143,11 @@ impl FakeModel {
             }
         });
         Ok(fake)
+    }
+
+    /// Saves each request's headers in `dir` as 0001.json, 0002.json, …
+    pub fn record_headers(&self, dir: PathBuf) {
+        self.record_headers.get_or_init(|| dir);
     }
 
     pub fn url(&self) -> String {
@@ -216,12 +224,15 @@ impl FakeModel {
         let n = self.count.fetch_add(1, Ordering::SeqCst) + 1;
         if let Some(dir) = &self.record {
             std::fs::write(dir.join(format!("{n:04}.json")), &body)?;
+        }
+        if let Some(dir) = self.record_headers.get() {
             let names: serde_json::Map<String, Value> = headers
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone().into()))
                 .collect();
+            std::fs::create_dir_all(dir)?;
             std::fs::write(
-                dir.join(format!("{n:04}.headers.json")),
+                dir.join(format!("{n:04}.json")),
                 Value::Object(names).to_string(),
             )?;
         }
