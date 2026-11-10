@@ -16,7 +16,7 @@ fn messages_come_back_byte_for_byte() {
     let asst = json!({ "role": "assistant", "content": [{ "type": "tool_use", "id": "t1", "name": "Read", "input": { "z": 1.5, "a": [1, 2] } }] });
     w.push_cursor("c1");
     w.push_message(&user);
-    w.push_model_call(42);
+    w.push_model_call(42, None);
     w.push_message(&asst);
     w.commit().unwrap();
     let texts = w.messages.clone();
@@ -64,6 +64,7 @@ fn compaction_restarts_the_context() {
     w.push_message(&json!({ "role": "assistant", "content": [{ "type": "text", "text": "b" }] }));
     w.push_compaction(
         &json!({ "role": "user", "content": [{ "type": "text", "text": "summary" }] }),
+        None,
     );
     w.push_message(&json!({ "role": "user", "content": "c" }));
     w.commit().unwrap();
@@ -93,5 +94,63 @@ fn answered_calls_need_no_repair() {
             r#"{"role":"assistant","content":[{"type":"tool_use","id":"a","name":"Read","input":{}}]}"#
         ),
         Some(vec!["a".to_string()])
+    );
+}
+
+#[test]
+fn a_fade_marker_rebuilds_the_same_bytes_after_a_load() {
+    let p = tmp("fade");
+    let mut w = Wire::load(&p).unwrap();
+    w.push_message(&json!({ "role": "user", "content": [{ "type": "text", "text": "go" }] }));
+    w.push_message(&json!({ "role": "assistant", "content": [{ "type": "tool_use", "id": "a", "name": "Read", "input": {} }, { "type": "tool_use", "id": "b", "name": "Read", "input": {} }] }));
+    let big = "x".repeat(4000);
+    w.push_message(&json!({ "role": "user", "content": [
+        { "type": "tool_result", "tool_use_id": "a", "content": [{ "type": "text", "text": big }] },
+        { "type": "tool_result", "tool_use_id": "b", "content": [{ "type": "text", "text": "small" }], "is_error": true },
+    ] }));
+    w.push_model_call(7, Some(2000));
+    let before = w.size();
+    assert_eq!(before, 2000);
+    let untouched = w.messages[..2].to_vec();
+    let mut stubs = Map::new();
+    stubs.insert("a".into(), "[stub of a]".into());
+    w.push_fade(stubs);
+    w.commit().unwrap();
+    assert_eq!(
+        &w.messages[..2],
+        &untouched[..],
+        "only the message holding the result changes"
+    );
+    assert!(w.messages[2].contains("[stub of a]") && !w.messages[2].contains(&big));
+    assert!(w.messages[2].contains("\"is_error\":true") && w.messages[2].contains("small"));
+    assert_eq!(before - w.size(), (4000 - "[stub of a]".len() as u64) / 4);
+    assert!(w.faded.contains("a"));
+    let w2 = Wire::load(&p).unwrap();
+    assert_eq!(w2.messages, w.messages, "the same bytes after a restart");
+    assert_eq!(w2.size(), w.size());
+    // the log itself is append-only: the result is still in it
+    assert!(std::fs::read_to_string(&p).unwrap().contains(&big));
+}
+
+#[test]
+fn a_compaction_keeps_its_ledger_and_forgets_fades() {
+    let p = tmp("ledger");
+    let mut w = Wire::load(&p).unwrap();
+    w.push_message(&json!({ "role": "user", "content": "a" }));
+    let mut stubs = Map::new();
+    stubs.insert("z".into(), "s".into());
+    w.push_fade(stubs);
+    let ledger = json!({ "files": ["/w/a.txt"], "latest": [] });
+    w.push_compaction(
+        &json!({ "role": "user", "content": "summary" }),
+        Some(ledger.clone()),
+    );
+    w.commit().unwrap();
+    let w2 = Wire::load(&p).unwrap();
+    assert_eq!(w2.ledger, Some(ledger));
+    assert!(w2.faded.is_empty());
+    assert_eq!(
+        w2.size(),
+        ("{\"role\":\"user\",\"content\":\"summary\"}".len() / 4) as u64
     );
 }

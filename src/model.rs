@@ -8,6 +8,7 @@ use tokio::sync::watch;
 
 const RETRY_STATUSES: [u16; 6] = [429, 500, 502, 503, 504, 529];
 
+#[derive(Clone)]
 pub struct Endpoint {
     pub url: Url,
     pub headers: Vec<(String, String)>,

@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::signal::unix::{SignalKind, signal};
 
-const USAGE: &str = "usage: shadow run [--model NAME] [--max-tokens N] [--base-url URL] \
-[--allow edit|shell] [--yes] [--session NAME] [--data-dir DIR] \"<prompt>\"";
+const USAGE: &str = "usage: shadow run [--model NAME] [--max-tokens N] [--context-tokens N] \
+[--base-url URL] [--allow edit|shell] [--yes] [--session NAME] [--data-dir DIR] \"<prompt>\"";
 
 const PROMPT: &str = "You are Shadow, a coding agent working in the user's terminal, in the folder {cwd}.
 
@@ -36,6 +36,7 @@ struct Opts {
     prompt: String,
     model: Option<String>,
     max_tokens: u64,
+    context_tokens: u64,
     base_url: Option<String>,
     edit: bool,
     shell: bool,
@@ -46,6 +47,7 @@ struct Opts {
 fn parse(args: &[String]) -> Result<Option<Opts>, String> {
     let mut o = Opts {
         max_tokens: 16000,
+        context_tokens: 200_000,
         ..Opts::default()
     };
     let mut words = Vec::new();
@@ -74,6 +76,13 @@ fn parse(args: &[String]) -> Result<Option<Opts>, String> {
                     .ok()
                     .filter(|n| *n > 0)
                     .ok_or("--max-tokens needs a positive number")?;
+            }
+            "--context-tokens" => {
+                o.context_tokens = value()?
+                    .parse()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .ok_or("--context-tokens needs a positive number")?;
             }
             "--allow" => {
                 for what in value()?.split(',') {
@@ -259,6 +268,8 @@ fn turn_params(
         "cwd": cwd,
         "model": model,
         "request": { "max_tokens": o.max_tokens },
+        "limits": { "context_tokens": o.context_tokens },
+        "auto_compact": true,
         "system": system,
         "host_tools": [],
         "endpoint": { "url": url, "headers": headers },
@@ -390,10 +401,13 @@ impl View {
             .and_then(Value::as_str)
             .unwrap_or_default();
         let p = &msg["params"];
+        // A branch's tool lines are indented; its text is not shown.
+        let branch = p.get("branch").is_some();
+        let pad = if branch { "  " } else { "" };
         let result = match (method, msg.get("id")) {
-            ("tool.check", Some(_)) => Some(self.check(&p["call"])),
+            ("tool.check", Some(_)) => Some(self.check(&p["call"], pad)),
             ("tool.end", Some(_)) => {
-                self.ended(p);
+                self.ended(p, pad);
                 Some(json!({}))
             }
             (_, Some(_)) => Some(Value::Null),
@@ -414,7 +428,9 @@ impl View {
         }
         match method {
             "model.event"
-                if p.pointer("/event/delta/type").and_then(Value::as_str) == Some("text_delta") =>
+                if !branch
+                    && p.pointer("/event/delta/type").and_then(Value::as_str)
+                        == Some("text_delta") =>
             {
                 let text = p
                     .pointer("/event/delta/text")
@@ -424,7 +440,7 @@ impl View {
                     self.print(text);
                 }
             }
-            "message.end" => self.newline(),
+            "message.end" if !branch => self.newline(),
             "retry" => {
                 let why = p["status"]
                     .as_u64()
@@ -475,18 +491,18 @@ impl View {
 
     /// Reading and searching are always allowed; Write and Edit need
     /// `--allow edit`, Bash `--allow shell`.
-    fn check(&mut self, call: &Value) -> Value {
+    fn check(&mut self, call: &Value, pad: &str) -> Value {
         let name = call["name"].as_str().unwrap_or_default();
         let label = label(name, &call["input"]);
         self.newline();
-        eprintln!("> {label}");
+        eprintln!("{pad}> {label}");
         let refused = match name {
             "Write" | "Edit" if !self.opts.edit => Some("edit"),
             "Bash" if !self.opts.shell => Some("shell"),
             _ => None,
         };
         if let Some(what) = refused {
-            eprintln!("  {label}: not allowed (run with --allow {what})");
+            eprintln!("{pad}  {label}: not allowed (run with --allow {what})");
             return json!({ "decision": "deny", "message": format!("Not allowed: this run was started without --allow {what}.") });
         }
         self.labels
@@ -495,7 +511,7 @@ impl View {
     }
 
     /// A short line for a tool result.
-    fn ended(&mut self, p: &Value) {
+    fn ended(&mut self, p: &Value, pad: &str) {
         let label = self
             .labels
             .remove(p["call_id"].as_str().unwrap_or_default())
@@ -520,16 +536,17 @@ impl View {
         } else {
             format!("{} lines", text.lines().count())
         };
-        eprintln!("  {label}: {summary}");
+        eprintln!("{pad}  {label}: {summary}");
     }
 }
 
 /// "Read src/main.rs", "Bash cargo test" — the call's main argument, cut short.
-fn label(name: &str, input: &Value) -> String {
+pub fn label(name: &str, input: &Value) -> String {
     let key = match name {
         "Read" | "Write" | "Edit" => "file_path",
         "Bash" => "command",
         "Grep" | "Glob" => "pattern",
+        "Branch" => "task",
         _ => "task_id",
     };
     let arg = input[key].as_str().unwrap_or_default();

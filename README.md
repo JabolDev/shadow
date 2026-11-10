@@ -1,7 +1,7 @@
 # Shadow
 
-Shadow is a small, fast coding agent. It runs a model in a loop with seven
-tools: Read, Write, Edit, Bash, TaskStop, Grep and Glob. It can run in two ways:
+Shadow is a small, fast coding agent. It runs a model in a loop with eight
+tools: Read, Write, Edit, Bash, TaskStop, Grep, Glob and Branch. It can run in two ways:
 
 - `shadow run "<prompt>"` runs one prompt in the current folder from a terminal.
 - `shadow serve` lets another program drive it over stdin/stdout (see `PROTOCOL.md`).
@@ -38,6 +38,7 @@ need permission:
 |---|---|
 | `--model NAME` | the model (or `SHADOW_MODEL`); there is no default |
 | `--max-tokens N` | `max_tokens` of each request (default 16000) |
+| `--context-tokens N` | the size of the model's window (default 200000); the chat compacts itself at 85% of it |
 | `--allow edit` | allow Write and Edit |
 | `--allow shell` | allow Bash |
 | `--yes` | allow both |
@@ -46,7 +47,9 @@ need permission:
 | `--base-url URL` | another Anthropic-format endpoint (`http://` or `https://`) |
 
 A refused call is answered to the model with the reason, for example
-`Not allowed: this run was started without --allow shell.`
+`Not allowed: this run was started without --allow shell.` The calls of a
+`Branch` follow the same rules; their lines on stderr are indented by two
+more spaces, and a branch's own text is not printed.
 
 The prompt is built in, and names the working folder. If the folder has an
 `AGENTS.md`, its text is added after it.
@@ -73,6 +76,7 @@ is shown and stored as received.
 | `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY` | the API key (see above) |
 | `SHADOW_MODEL` | the model, when `--model` is not given |
 | `SHADOW_TEST_CA` | **tests only**: a PEM file of extra certificates to trust for `https://`. Never set it in normal use. |
+| `SHADOW_TEST_CACHE_TTL_MS` | **tests only**: the prompt cache's lifetime in ms. Never set it in normal use. |
 
 ## Serve
 
@@ -84,6 +88,24 @@ One process serves many chats. It speaks protocol v1: one JSON object per
 line on stdin and stdout. The host sends the model, the endpoint (URL and
 headers), the system prompt and its own tools with each turn. `PROTOCOL.md`
 describes every message.
+
+## Long chats
+
+Shadow keeps a long chat small without breaking the model's prompt cache
+more than needed (`PROTOCOL.md` has the details):
+
+- Old bulky tool results fade to a one-line note saying how to get them back,
+  in one batch: when a chat starts again after its cache has expired, or
+  when the context reaches 60% of the window (down to 40%).
+- At 85% the chat is compacted: the model writes a summary, and Shadow keeps
+  the changed files, the running commands and the newest result of chosen
+  host tools word for word.
+- A turn starts with a short note of what changed meanwhile (files, ended
+  commands, time); the model sees one line at 50, 75 and 90% of the window;
+  the third identical call in a row with an identical result gets a one-line
+  answer.
+- `Branch` runs a task on a copy of the conversation and returns only its
+  answer, so looking things up does not fill the conversation.
 
 ## Data
 

@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use std::time::Duration;
 
 #[test]
-fn tools_command_prints_seven_small_definitions() {
+fn tools_command_prints_eight_small_definitions() {
     let out = std::process::Command::new(shadow_bin())
         .arg("tools")
         .output()
@@ -17,7 +17,9 @@ fn tools_command_prints_seven_small_definitions() {
     let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
     assert_eq!(
         names,
-        ["Read", "Write", "Edit", "Bash", "TaskStop", "Grep", "Glob"]
+        [
+            "Read", "Write", "Edit", "Bash", "TaskStop", "Grep", "Glob", "Branch"
+        ]
     );
     assert!(out.stdout.len() <= 12_000, "{} bytes", out.stdout.len());
     for d in &defs {
@@ -194,7 +196,7 @@ fn full_turn_order() {
     assert_eq!(
         tools,
         [
-            "Read", "Write", "Edit", "Bash", "TaskStop", "Grep", "Glob", "notes"
+            "Read", "Write", "Edit", "Bash", "TaskStop", "Grep", "Glob", "Branch", "notes"
         ]
     );
     let message_end = e
@@ -240,7 +242,7 @@ fn cache_marks_and_native_subset() {
         json!({ "type": "ephemeral" })
     );
     assert_eq!(
-        b[0]["tools"][6]["cache_control"],
+        b[0]["tools"][7]["cache_control"],
         json!({ "type": "ephemeral" })
     );
     assert_eq!(

@@ -1,7 +1,9 @@
-//! Plain compaction (`session.compact`): the model writes a summary of the
-//! chat; a compaction marker holding it is logged, and from then on the
-//! context is that one user message plus later messages.
+//! Compaction (`session.compact`, and a turn's auto-compaction): the model
+//! writes a summary of the chat; a compaction marker holding it and the
+//! ledger is logged, and from then on the context is that one user message
+//! plus later messages.
 
+use crate::context;
 use crate::model::{self, Endpoint, Outcome};
 use crate::rpc::Host;
 use crate::session::Session;
@@ -22,6 +24,17 @@ commands that mattered and their results; errors and how they were fixed; what i
 Be specific. Reply with the summary only and do not call any tool.";
 
 const LEAD: &str = "This chat was compacted. Summary of the conversation before this point:\n\n";
+
+/// What the summary call sends besides the messages.
+pub struct Ask<'a> {
+    pub model: &'a str,
+    pub system: Option<&'a Value>,
+    pub tools: &'a [Value],
+    pub request: &'a Map<String, Value>,
+    pub cache: Option<&'a Value>,
+    pub endpoint: &'a Endpoint,
+    pub retry_max: u32,
+}
 
 #[derive(Deserialize)]
 struct Params {
@@ -87,29 +100,72 @@ async fn summarize(
         return Err("the chat has no messages to compact".into());
     }
     let before = wire.messages.len();
-    let mut messages = wire.messages.clone();
-    let ask = json!({ "role": "user", "content": [{ "type": "text", "text": prompt.as_deref().unwrap_or(PROMPT) }] });
-    messages.push(ask.to_string());
-    let tools = session
-        .lock()
-        .last_tools
-        .clone()
-        .unwrap_or_else(|| Arc::new(tools::definitions()));
+    let (tools, keep, cap) = {
+        let st = session.lock();
+        let tools = st.last_tools.clone();
+        (
+            tools.unwrap_or_else(|| Arc::new(tools::definitions())),
+            st.last_keep.clone(),
+            st.last_cap,
+        )
+    };
     let system = system.map(Value::Array);
-    let body = model::body(
+    let ask = Ask {
         model,
-        system.as_ref(),
-        &tools,
-        &messages,
-        &request,
-        Some(&json!({ "type": "ephemeral" })),
-    );
+        system: system.as_ref(),
+        tools: &tools,
+        request: &request,
+        cache: Some(&json!({ "type": "ephemeral" })),
+        endpoint: ep,
+        retry_max: RETRY_MAX,
+    };
     let (_never_stopped, mut stop) = watch::channel(false);
+    let (summary, _) = summary(&ask, wire.messages.clone(), prompt.as_deref(), &mut stop).await?;
+    let cap = cap.unwrap_or(30_000);
+    let (msg, ledger) = message(
+        &wire.messages,
+        wire.ledger.as_ref(),
+        &summary,
+        session,
+        &keep,
+        cap,
+    )?;
+    wire.push_compaction(&msg, ledger);
+    wire.commit()
+        .map_err(|e| format!("cannot write the wire log: {e}"))?;
+    let mut versions = Versions::load(&session.versions_path());
+    versions.clear_shown();
+    versions
+        .save()
+        .map_err(|e| format!("cannot write the version table: {e}"))?;
+    Ok(
+        json!({ "summary": summary, "messages_before": before, "messages_after": wire.messages.len() }),
+    )
+}
+
+/// The summary call: `messages` plus one user message with the summary
+/// prompt. Returns the summary text and the call's usage.
+pub async fn summary(
+    ask: &Ask<'_>,
+    mut messages: Vec<String>,
+    prompt: Option<&str>,
+    stop: &mut watch::Receiver<bool>,
+) -> Result<(String, Value), String> {
+    let text = json!({ "role": "user", "content": [{ "type": "text", "text": prompt.unwrap_or(PROMPT) }] });
+    messages.push(text.to_string());
+    let body = model::body(
+        ask.model,
+        ask.system,
+        ask.tools,
+        &messages,
+        ask.request,
+        ask.cache,
+    );
     let reply = match model::call(
-        ep,
+        ask.endpoint,
         &body,
-        RETRY_MAX,
-        &mut stop,
+        ask.retry_max,
+        stop,
         &mut |_| {},
         &mut |_, _, _| {},
     )
@@ -137,15 +193,26 @@ async fn summarize(
     if summary.is_empty() {
         return Err("the model returned no summary text".into());
     }
-    wire.push_compaction(&json!({ "role": "user", "content": [{ "type": "text", "text": format!("{LEAD}{summary}") }] }));
-    wire.commit()
-        .map_err(|e| format!("cannot write the wire log: {e}"))?;
-    let mut versions = Versions::load(&session.versions_path());
-    versions.clear_shown();
-    versions
-        .save()
-        .map_err(|e| format!("cannot write the version table: {e}"))?;
-    Ok(
-        json!({ "summary": summary, "messages_before": before, "messages_after": wire.messages.len() }),
-    )
+    Ok((summary, reply.usage))
+}
+
+/// The compaction marker's summary message (the ledger as a second text
+/// block) and the ledger itself (carried into the next one), for a
+/// compaction of `messages`. Err when the ledger cannot be made: the
+/// compaction fails.
+pub fn message(
+    messages: &[String],
+    earlier: Option<&Value>,
+    summary: &str,
+    session: &Session,
+    keep: &[String],
+    cap: usize,
+) -> Result<(Value, Option<Value>), String> {
+    let mut content = vec![json!({ "type": "text", "text": format!("{LEAD}{summary}") })];
+    let ledger = context::ledger(messages, earlier, session, keep, cap)?;
+    if let Some((_, text)) = &ledger {
+        content.push(json!({ "type": "text", "text": text }));
+    }
+    let msg = json!({ "role": "user", "content": content });
+    Ok((msg, ledger.map(|l| l.0)))
 }

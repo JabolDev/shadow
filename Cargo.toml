@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
 publish = false
-description = "Shadow: a headless agent harness. Many chats over stdin/stdout, the model loop and seven tools."
+description = "Shadow: a headless agent harness. Many chats over stdin/stdout, the model loop and eight tools."
 
 [[bin]]
 name = "shadow"

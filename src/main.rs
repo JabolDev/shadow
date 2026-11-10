@@ -2,11 +2,12 @@
 //!
 //!   shadow run "<prompt>"   runs one prompt in the current folder (README.md)
 //!   shadow serve            serves many chats over stdin/stdout (protocol v1, PROTOCOL.md)
-//!   shadow tools            prints the seven native tool definitions as JSON
+//!   shadow tools            prints the eight native tool definitions as JSON
 
 mod cli;
 mod cli_os;
 mod compact;
+mod context;
 mod http;
 mod model;
 mod rpc;

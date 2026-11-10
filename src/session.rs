@@ -21,6 +21,9 @@ pub struct State {
     pub tasks: Vec<Task>,
     /// The tool definitions of the latest turn (sent again by compaction).
     pub last_tools: Option<Arc<Vec<Value>>>,
+    /// The latest turn's `keep_latest` host tools and result cap (for the ledger).
+    pub last_keep: Vec<String>,
+    pub last_cap: Option<usize>,
 }
 
 /// The host's handles on a running turn.
@@ -30,8 +33,8 @@ pub struct TurnCtl {
     /// The number of steer messages waiting (a foreground command watches it).
     pub waiting: watch::Sender<usize>,
     pub steers: Vec<Steer>,
-    /// "Background task … ended" lines for the next step boundary.
-    pub notes: Vec<String>,
+    /// (task id, "Background task … ended" line) for the next step boundary.
+    pub notes: Vec<(String, String)>,
 }
 
 pub struct Steer {
@@ -42,7 +45,7 @@ pub struct Steer {
 /// What a step boundary hands to the model besides tool results.
 #[derive(Default)]
 pub struct Inbox {
-    pub notes: Vec<String>,
+    pub notes: Vec<(String, String)>,
     pub steers: Vec<Steer>,
 }
 
@@ -52,7 +55,7 @@ impl Inbox {
         let mut out: Vec<Value> = self
             .notes
             .iter()
-            .map(|n| json!({ "type": "text", "text": n }))
+            .map(|(_, n)| json!({ "type": "text", "text": n }))
             .collect();
         for s in &self.steers {
             out.extend(s.input.iter().cloned());
@@ -91,6 +94,8 @@ pub struct Task {
     pub stop_requested: bool,
     /// Stopped by the model's TaskStop: it already has the outcome, no note.
     pub stopped_by_tool: bool,
+    /// The model was told it ended (a note, or a turn's state delta).
+    pub announced: bool,
     /// Turns true when the process has exited.
     pub done: watch::Receiver<bool>,
 }

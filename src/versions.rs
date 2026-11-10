@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 /// Texts above this size are not kept (a stale edit then says "read it again").
 const MAX_TEXT: u64 = 4 * 1024 * 1024;
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 pub struct Versions {
     pub files: BTreeMap<String, Seen>,
     #[serde(skip)]
@@ -32,6 +32,9 @@ pub struct Seen {
     /// Line ranges Read returned since the last compaction.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shown: Vec<Shown>,
+    /// The hash ("gone" when deleted) a turn's state delta already named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub told: Option<String>,
 }
 
 /// A file version as Read saw it.
@@ -154,9 +157,60 @@ impl Versions {
                 lines,
                 text,
                 shown: Vec::new(),
+                told: None,
             },
         );
         self.dirty = true;
+    }
+
+    /// A fade: what Read returned at `step` for `path` is no longer in view.
+    pub fn forget(&mut self, path: &str, step: u64) {
+        if let Some(seen) = self.files.get_mut(path) {
+            seen.shown.retain(|r| r.step != step);
+            self.dirty = true;
+        }
+    }
+
+    /// The state delta's file lines: every file that differs from the
+    /// version the model saw, named once per new version. Not "seen".
+    pub fn changed_outside(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (path, seen) in self.files.iter_mut() {
+            let now = match std::fs::read(path) {
+                Ok(b) => Some(b),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                Err(_) => continue,
+            };
+            let tag = now.as_deref().map_or_else(|| "gone".to_string(), hash);
+            if tag == seen.hash || seen.told.as_ref() == Some(&tag) {
+                continue;
+            }
+            let text = now.as_deref().map(std::str::from_utf8);
+            out.push(match (text, seen.text.as_deref()) {
+                (None, _) => format!("{path} was deleted."),
+                (Some(Ok(new)), Some(old)) => {
+                    let (mut added, mut removed) = (0, 0);
+                    let diff = similar::TextDiff::configure()
+                        .timeout(std::time::Duration::from_millis(200))
+                        .diff_lines(old, new);
+                    for c in diff.iter_all_changes() {
+                        match c.tag() {
+                            similar::ChangeTag::Insert => added += 1,
+                            similar::ChangeTag::Delete => removed += 1,
+                            similar::ChangeTag::Equal => {}
+                        }
+                    }
+                    format!("{path} was changed outside this chat: {added} lines added, {removed} removed.")
+                }
+                (Some(_), _) => format!(
+                    "{path} was changed outside this chat (it is now {} bytes).",
+                    now.as_ref().map_or(0, Vec::len)
+                ),
+            });
+            seen.told = Some(tag);
+            self.dirty = true;
+        }
+        out
     }
 
     /// Compaction: what Read returned is no longer in view.
