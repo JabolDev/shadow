@@ -1,0 +1,34 @@
+[package]
+name = "shadow"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+publish = false
+description = "Shadow: a headless agent harness. Many chats over stdin/stdout, the model loop and seven tools."
+
+[[bin]]
+name = "shadow"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "io-util", "io-std", "net", "process", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
+grep-regex = "0.1"
+grep-searcher = "0.1"
+ignore = "0.4"
+globset = "0.4"
+similar = "2"
+base64 = "0.23"
+libc = "0.2"
+
+[dev-dependencies]
+shadow-testkit = { path = "testkit" }
+
+[workspace]
+members = [".", "testkit"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
