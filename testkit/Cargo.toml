@@ -1,0 +1,9 @@
+[package]
+name = "shadow-testkit"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Test-only tools for shadow: a fake model server and a scripted host"
+
+[dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }
