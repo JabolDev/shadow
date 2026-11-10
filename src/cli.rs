@@ -137,6 +137,18 @@ pub fn run(args: &[String]) -> i32 {
         std::env::remove_var(ANTHROPIC.0);
         std::env::remove_var(OPENROUTER.0);
     }
+    // The kernel still shows the starting environment, keys included, in
+    // /proc/<pid>/environ. A process that cannot be dumped hides it, and its
+    // memory, from the commands the model runs (they exec, so they can be).
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: prctl(2) with PR_SET_DUMPABLE only reads its integer arguments.
+        if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+            let e = std::io::Error::last_os_error();
+            eprintln!("shadow: cannot hide the API key from commands: {e}");
+            return 1;
+        }
+    }
     let model = opts.model.clone().or_else(|| var("SHADOW_MODEL"));
     let endpoint = endpoint(keys.0, keys.1, opts.base_url.as_deref());
     let missing: Vec<&str> = [

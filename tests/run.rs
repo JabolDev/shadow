@@ -508,7 +508,9 @@ fn r9_background_commands_end_with_the_run() {
 
 #[test]
 fn the_key_never_reaches_commands_files_or_output() {
-    let probe = json!({ "tool_calls": [{ "name": "Bash", "input": { "command": "echo \"seen=${ANTHROPIC_API_KEY:-none} ${OPENROUTER_API_KEY:-none}\"; env | grep -c API_KEY || true" } }] });
+    // the command's own environment, then its parent's (the shadow process) through /proc
+    let look = "echo \"seen=${ANTHROPIC_API_KEY:-none} ${OPENROUTER_API_KEY:-none}\"; env | grep -c API_KEY; cat /proc/$PPID/environ";
+    let probe = json!({ "tool_calls": [{ "name": "Bash", "input": { "command": look } }] });
     let denied = json!({ "status": 401, "body": { "type": "error", "error": { "type": "authentication_error", "message": "invalid x-api-key" } } });
     let fake =
         FakeModel::start(vec![probe, json!({ "text": "checked" }), denied], 0, None).unwrap();
@@ -525,7 +527,12 @@ fn the_key_never_reaches_commands_files_or_output() {
         .last()
         .unwrap()["content"][0]
         .clone();
-    assert_eq!(text(&result), "seen=none none\n0");
+    let seen = text(&result);
+    assert!(
+        seen.starts_with("seen=none none\n0\ncat: /proc/")
+            && seen.contains("/environ: Permission denied"),
+        "{seen}"
+    );
     // an API error: printed, exit 1, without the request headers
     let o2 = cmd(&b, &fake.url(), &["again"]).output().unwrap();
     let (stdout2, stderr2) = out(&o2);
