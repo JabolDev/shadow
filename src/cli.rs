@@ -13,7 +13,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::watch;
 
 const USAGE: &str = "usage: shadow run [--model NAME] [--max-tokens N] [--base-url URL] \
 [--allow edit|shell] [--yes] [--session NAME] [--data-dir DIR] \"<prompt>\"";
@@ -129,34 +128,33 @@ pub fn run(args: &[String]) -> i32 {
         std::env::remove_var(OPENROUTER.0);
     }
     let secrets: Vec<String> = [&keys.0, &keys.1].into_iter().flatten().cloned().collect();
-    let stderr = match cli_os::redact_stderr(secrets) {
-        Ok(s) => s,
+    let out = match cli_os::output(secrets) {
+        Ok(o) => o,
         Err(e) => {
             // No key can be in this line; stderr may be gone, so no panic either.
             let _ = writeln!(std::io::stderr(), "shadow: cannot set up stderr: {e}");
             return 1;
         }
     };
-    let broken = stderr.broken.clone();
     // A panic is printed (through the redacting stderr) and still cleaned up after.
-    let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_with(args, keys, broken)
-    }))
-    .unwrap_or(101);
+    let code =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_with(args, keys, &out)))
+            .unwrap_or(101);
     // Whatever ended the run, no process it started is left: also the ones
     // its commands left behind.
     cli_os::end_children();
-    match (stderr.finish(), code) {
-        (false, 0) => 1,
+    out.close();
+    // After a signal, output still waiting for a reader is dropped.
+    if code < 128 {
+        out.wait();
+    }
+    match (out.failed(), code) {
+        (true, 0) => 1,
         (_, code) => code,
     }
 }
 
-fn run_with(
-    args: &[String],
-    keys: (Option<String>, Option<String>),
-    broken: watch::Receiver<bool>,
-) -> i32 {
+fn run_with(args: &[String], keys: (Option<String>, Option<String>), out: &cli_os::Output) -> i32 {
     let opts = match parse(args) {
         Ok(Some(o)) => o,
         Ok(None) => {
@@ -213,7 +211,7 @@ fn run_with(
         .build()
     {
         Ok(rt) => {
-            let code = rt.block_on(go(opts, data_dir, params, broken));
+            let code = rt.block_on(go(opts, data_dir, params, out));
             // Everything the run started has ended; do not wait for idle threads.
             rt.shutdown_background();
             code
@@ -279,12 +277,7 @@ fn agents_md(cwd: &Path) -> Result<Option<String>, String> {
     }
 }
 
-async fn go(
-    opts: Opts,
-    data_dir: PathBuf,
-    params: Value,
-    mut broken: watch::Receiver<bool>,
-) -> i32 {
+async fn go(opts: Opts, data_dir: PathBuf, params: Value, out: &cli_os::Output) -> i32 {
     let watch = |kind| signal(kind).map_err(|e| eprintln!("shadow: cannot watch for signals: {e}"));
     let (Ok(mut int), Ok(mut term), Ok(mut hup), Ok(mut child)) = (
         watch(SignalKind::interrupt()),
@@ -311,21 +304,16 @@ async fn go(
         opts,
         at_line_start: true,
         labels: BTreeMap::new(),
-        out_error: None,
+        out: out.stdout(),
     };
+    let mut state = out.state.clone();
     let mut signalled: Option<i32> = None;
-    let mut stderr_failed = false;
+    let mut failed = false;
     let reason = loop {
         let got = tokio::select! {
             line = lines.recv() => {
                 let Some(line) = line else { break "error".to_string() };
-                let had_error = view.out_error.is_some();
-                let ended = view.line(&host, line);
-                if let (false, Some(e)) = (had_error, &view.out_error) {
-                    eprintln!("shadow: cannot write the output ({e}); stopping");
-                    stop(&session);
-                }
-                if let Some(reason) = ended {
+                if let Some(reason) = view.line(&host, line) {
                     break reason;
                 }
                 None
@@ -337,8 +325,8 @@ async fn go(
                 cli_os::reap_orphans();
                 None
             }
-            Ok(_) = broken.wait_for(|b| *b), if !stderr_failed => {
-                stderr_failed = true;
+            Ok(_) = state.wait_for(|s| s[0] || s[1]), if !failed => {
+                failed = true;
                 stop(&session);
                 None
             }
@@ -358,9 +346,21 @@ async fn go(
             _ = child.recv() => cli_os::reap_orphans(),
         }
     }
-    match (signalled, reason.as_str(), &view.out_error, stderr_failed) {
-        (Some(signo), _, _, _) => 128 + signo,
-        (None, "done", None, false) => 0,
+    // Then what the commands left behind, before waiting on a slow reader.
+    drop(view);
+    let _ = tokio::task::spawn_blocking(cli_os::end_children).await;
+    out.close();
+    if signalled.is_none() {
+        signalled = tokio::select! {
+            _ = state.wait_for(|s| s[2]) => None,
+            _ = int.recv() => Some(libc::SIGINT),
+            _ = term.recv() => Some(libc::SIGTERM),
+            _ = hup.recv() => Some(libc::SIGHUP),
+        };
+    }
+    match (signalled, reason.as_str(), out.failed()) {
+        (Some(signo), _, _) => 128 + signo,
+        (None, "done", false) => 0,
         _ => 1,
     }
 }
@@ -377,8 +377,8 @@ struct View {
     at_line_start: bool,
     /// Call id → its short label, for the result line.
     labels: BTreeMap<String, String>,
-    /// The first failure to write stdout; nothing more is written after it.
-    out_error: Option<std::io::Error>,
+    /// The model's text goes to the output writer through this.
+    out: Option<cli_os::ToWriter>,
 }
 
 impl View {
@@ -459,13 +459,10 @@ impl View {
 
     /// The model's text on stdout, as it comes.
     fn print(&mut self, text: &str) {
-        if self.out_error.is_some() {
-            return;
-        }
-        let mut out = std::io::stdout().lock();
-        match out.write_all(text.as_bytes()).and_then(|_| out.flush()) {
-            Ok(()) => self.at_line_start = text.ends_with('\n'),
-            Err(e) => self.out_error = Some(e),
+        if let Some(out) = &self.out
+            && out.send((cli_os::STDOUT, text.as_bytes().to_vec())).is_ok()
+        {
+            self.at_line_start = text.ends_with('\n');
         }
     }
 

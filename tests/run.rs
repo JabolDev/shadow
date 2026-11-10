@@ -838,3 +838,100 @@ fn f3_ending_the_run_is_not_slowed_by_orphans() {
     assert!(took < Duration::from_millis(1500), "took {took:?}");
     assert!(alive(&a).is_empty() && alive(&b2).is_empty());
 }
+
+/// Waits up to `limit` for a live process whose command line holds `needle`.
+fn wait_alive(needle: &str, limit: Duration) -> bool {
+    let until = Instant::now() + limit;
+    while alive(needle).is_empty() {
+        if Instant::now() > until {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    true
+}
+
+/// Sends `sig` and returns (exit code, how long the exit took).
+fn signal_and_wait(child: &mut Child, sig: i32) -> (Option<i32>, Duration) {
+    // SAFETY: kill(2) with a pid this test started.
+    assert_eq!(unsafe { libc::kill(child.id() as i32, sig) }, 0);
+    let sent = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if sent.elapsed() > Duration::from_secs(5) {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            return (None, sent.elapsed());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    (child.wait().unwrap().code(), sent.elapsed())
+}
+
+#[test]
+fn f4_a_signal_ends_the_run_while_stdout_is_not_read() {
+    let id = std::process::id();
+    let (bg, fg) = (format!("sleep 75.{id}"), format!("sleep 76.{id}"));
+    // about 320 KB of answer, then a command: nobody reads stdout
+    let words: String = (0..8000)
+        .map(|i| format!("paragraph {i:05} of a long answer\n"))
+        .collect();
+    let script = vec![
+        json!({ "tool_calls": [{ "name": "Bash", "input": { "command": bg, "run_in_background": true } }] }),
+        json!({ "text": words, "chunk": 4096, "tool_calls": [{ "name": "Bash", "input": { "command": fg } }] }),
+    ];
+    let fake = FakeModel::start(script, 0, None).unwrap();
+    let b = place("f4out");
+    let mut child = cmd(&b, &fake.url(), &["--yes", "write a lot"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _unread = child.stdout.take();
+    assert!(
+        wait_alive(&bg, LONG),
+        "the background command never started"
+    );
+    wait_alive(&fg, Duration::from_secs(3));
+    std::thread::sleep(Duration::from_millis(300));
+    let (code, took) = signal_and_wait(&mut child, libc::SIGTERM);
+    assert_eq!(code, Some(143), "after {took:?}");
+    assert!(took < Duration::from_secs(1), "exit {took:?} after SIGTERM");
+    assert!(
+        alive(&bg).is_empty() && alive(&fg).is_empty(),
+        "a command was left running"
+    );
+}
+
+#[test]
+fn f4_a_signal_ends_the_run_while_stderr_is_not_read() {
+    let id = std::process::id();
+    let (bg, fg) = (format!("sleep 77.{id}"), format!("sleep 78.{id}"));
+    // 600 tool lines of about 190 characters, then a command: nobody reads stderr
+    let globs: Vec<Value> = (0..600).map(|i| json!({ "name": "Glob", "input": { "pattern": format!("{i:04}-{}", "q".repeat(96)) } })).collect();
+    let script = vec![
+        json!({ "tool_calls": [{ "name": "Bash", "input": { "command": bg, "run_in_background": true } }] }),
+        json!({ "tool_calls": globs, "chunk": 4096 }),
+        json!({ "tool_calls": [{ "name": "Bash", "input": { "command": fg } }] }),
+    ];
+    let fake = FakeModel::start(script, 0, None).unwrap();
+    let b = place("f4err");
+    let mut child = cmd(&b, &fake.url(), &["--yes", "look everywhere"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _unread = child.stderr.take();
+    assert!(
+        wait_alive(&bg, LONG),
+        "the background command never started"
+    );
+    wait_alive(&fg, Duration::from_secs(3));
+    std::thread::sleep(Duration::from_millis(300));
+    let (code, took) = signal_and_wait(&mut child, libc::SIGHUP);
+    assert_eq!(code, Some(129), "after {took:?}");
+    assert!(took < Duration::from_secs(1), "exit {took:?} after SIGHUP");
+    assert!(
+        alive(&bg).is_empty() && alive(&fg).is_empty(),
+        "a command was left running"
+    );
+}

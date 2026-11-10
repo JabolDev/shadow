@@ -1,28 +1,43 @@
 //! What `shadow run` asks of the system so that it owns its output and its
 //! processes:
-//! - stderr (fd 2) is a pipe; one thread writes what comes through it to the
-//!   real stderr with each key value replaced by `[redacted]`. When the real
-//!   stderr fails, it keeps reading (no writer fails or blocks) and says so
-//!   once, through `broken`.
+//! - one thread writes all output, in the order it comes: the model's text
+//!   (stdout) and everything written to fd 2 (stderr). fd 2 is a pipe that a
+//!   second thread drains at once, replacing each key value by `[redacted]`.
+//!   So no other thread ever waits on a reader: a signal is always seen, and
+//!   output still waiting when a signal ends the run is dropped.
 //! - the run is a child subreaper: a process its commands leave behind becomes
 //!   its child, so at the end it can end them by their own pids.
 
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::sync::mpsc::{Sender, channel};
+use std::sync::{Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
-pub struct Stderr {
+/// Bytes for stdout (`STDOUT`) or stderr, to the writer.
+pub type ToWriter = Sender<(usize, Vec<u8>)>;
+
+pub const STDOUT: usize = 0;
+const STDERR: usize = 1;
+
+pub struct Output {
     real: OwnedFd,
-    pipe: OwnedFd,
-    thread: JoinHandle<()>,
-    pub broken: watch::Receiver<bool>,
+    pipe: Mutex<Option<OwnedFd>>,
+    tx: Mutex<Option<ToWriter>>,
+    threads: Mutex<Vec<JoinHandle<()>>>,
+    /// [stdout failed, stderr failed, everything written]
+    pub state: watch::Receiver<[bool; 3]>,
 }
 
-/// Puts the redacting pipe in place of fd 2.
-pub fn redact_stderr(keys: Vec<String>) -> std::io::Result<Stderr> {
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Puts the redacting pipe in place of fd 2 and starts the writer.
+pub fn output(keys: Vec<String>) -> std::io::Result<Output> {
     let mut fds = [0; 2];
     // SAFETY: pipe2(2) writes two new descriptors into the array it is given;
     // F_DUPFD_CLOEXEC and dup2(2) only take and return descriptor numbers.
@@ -40,14 +55,39 @@ pub fn redact_stderr(keys: Vec<String>) -> std::io::Result<Stderr> {
         }
         (read, pipe, real)
     };
-    let (tell, broken) = watch::channel(false);
-    let mut out = File::from(real.try_clone()?);
-    let thread = std::thread::spawn(move || {
-        let (mut from, mut buf, mut held) = (File::from(read), [0; 8192], Vec::new());
-        let mut write = |bytes: &[u8]| {
-            if !*tell.borrow() && out.write_all(&redact(bytes, &keys)).is_err() {
-                tell.send_replace(true);
+    let (tell, state) = watch::channel([false; 3]);
+    let (tx, rx) = channel::<(usize, Vec<u8>)>();
+    let mut err = File::from(real.try_clone()?);
+    let writer = std::thread::spawn(move || {
+        for (to, bytes) in rx {
+            if tell.borrow()[to] {
+                continue;
             }
+            let wrote = match to {
+                STDOUT => std::io::stdout()
+                    .write_all(&bytes)
+                    .and_then(|_| std::io::stdout().flush()),
+                _ => err.write_all(&bytes),
+            };
+            if let Err(e) = wrote {
+                if to == STDOUT && !tell.borrow()[STDERR] {
+                    // Best effort: when this fails too, stderr is reported as failed below.
+                    let line = format!("shadow: cannot write the output ({e}); stopping\n");
+                    if err.write_all(line.as_bytes()).is_err() {
+                        tell.send_modify(|s| s[STDERR] = true);
+                    }
+                }
+                tell.send_modify(|s| s[to] = true);
+            }
+        }
+        tell.send_modify(|s| s[2] = true);
+    });
+    let to_writer = tx.clone();
+    let reader = std::thread::spawn(move || {
+        let (mut from, mut buf, mut held) = (File::from(read), [0; 8192], Vec::new());
+        let send = |bytes: &[u8]| {
+            // The writer only ends after this thread: the send cannot fail.
+            let _ = to_writer.send((STDERR, redact(bytes, &keys)));
         };
         loop {
             let n = match from.read(&mut buf) {
@@ -60,30 +100,52 @@ pub fn redact_stderr(keys: Vec<String>) -> std::io::Result<Stderr> {
             let cut = ready(&held, &keys);
             if cut > 0 {
                 let rest = held.split_off(cut);
-                write(&held);
+                send(&held);
                 held = rest;
             }
         }
-        write(&held);
+        if !held.is_empty() {
+            send(&held);
+        }
     });
-    Ok(Stderr {
+    Ok(Output {
         real,
-        pipe,
-        thread,
-        broken,
+        pipe: Mutex::new(Some(pipe)),
+        tx: Mutex::new(Some(tx)),
+        threads: Mutex::new(vec![reader, writer]),
+        state,
     })
 }
 
-impl Stderr {
-    /// Puts the real stderr back and waits until everything written got out.
-    /// False when the real stderr failed.
-    pub fn finish(self) -> bool {
-        // SAFETY: dup2(2) only takes descriptor numbers; fd 2 stops being the pipe.
-        unsafe { libc::dup2(self.real.as_raw_fd(), 2) };
-        drop(self.pipe);
-        // The thread ends when the pipe is closed; a panic there was already reported.
-        let _ = self.thread.join();
-        !*self.broken.borrow()
+impl Output {
+    /// A way to send the model's text to stdout.
+    pub fn stdout(&self) -> Option<ToWriter> {
+        lock(&self.tx).clone()
+    }
+
+    /// No more output: fd 2 is the real stderr again, so the reader ends after
+    /// the last byte, and the writer once everything is written.
+    pub fn close(&self) {
+        if let Some(pipe) = lock(&self.pipe).take() {
+            // SAFETY: dup2(2) only takes descriptor numbers; fd 2 stops being the pipe.
+            unsafe { libc::dup2(self.real.as_raw_fd(), 2) };
+            drop(pipe);
+        }
+        lock(&self.tx).take();
+    }
+
+    /// Waits until everything is written (after `close`).
+    pub fn wait(&self) {
+        for t in lock(&self.threads).drain(..) {
+            // A panic there was already reported.
+            let _ = t.join();
+        }
+    }
+
+    /// Writing to stdout or to stderr failed.
+    pub fn failed(&self) -> bool {
+        let s = *self.state.borrow();
+        s[STDOUT] || s[STDERR]
     }
 }
 
