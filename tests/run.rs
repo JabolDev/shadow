@@ -722,7 +722,15 @@ fn f2_a_closed_stderr_still_ends_everything() {
         .unwrap()
         .contains("running in the background")
     {}
-    assert_eq!(alive(&marker).len(), 1);
+    // the command may be mid-exec (an empty cmdline) for an instant
+    let until = Instant::now() + LONG;
+    while alive(&marker).len() != 1 {
+        assert!(
+            Instant::now() < until,
+            "the background command never showed"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     drop(lines);
     let started = Instant::now();
     let code = child.wait().unwrap().code();
