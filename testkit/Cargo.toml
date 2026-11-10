@@ -6,4 +6,6 @@ publish = false
 description = "Test-only tools for shadow: a fake model server and a scripted host"
 
 [dependencies]
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 serde_json = { version = "1", features = ["preserve_order"] }

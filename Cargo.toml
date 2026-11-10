@@ -11,7 +11,7 @@ name = "shadow"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "io-util", "io-std", "net", "process", "sync", "time"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "io-util", "io-std", "net", "process", "signal", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 grep-regex = "0.1"
@@ -21,6 +21,9 @@ globset = "0.4"
 similar = "2"
 base64 = "0.23"
 libc = "0.2"
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1.0.11"
 
 [dev-dependencies]
 shadow-testkit = { path = "testkit" }

@@ -3,7 +3,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 
 #[test]
-fn parses_plain_http_urls_only() {
+fn parses_http_and_https_urls() {
     let u = Url::parse("http://127.0.0.1:8080/v1/messages?beta=1").unwrap();
     assert_eq!(
         (u.host.as_str(), u.port, u.path.as_str()),
@@ -19,7 +19,18 @@ fn parses_plain_http_urls_only() {
         (u.host.as_str(), u.port, u.host_header().as_str()),
         ("::1", 9, "[::1]:9")
     );
-    assert!(Url::parse("https://127.0.0.1/x").is_err());
+    let u = Url::parse("https://api.example.com/v1/messages").unwrap();
+    assert_eq!(
+        (u.tls, u.port, u.path.as_str(), u.host_header().as_str()),
+        (true, 443, "/v1/messages", "api.example.com")
+    );
+    let u = Url::parse("https://127.0.0.1:8443").unwrap();
+    assert_eq!(
+        (u.tls, u.port, u.host_header().as_str()),
+        (true, 8443, "127.0.0.1:8443")
+    );
+    assert!(!Url::parse("http://h/").unwrap().tls);
+    assert!(Url::parse("ftp://127.0.0.1/x").is_err());
     assert!(Url::parse("http://h:99999/").is_err());
     assert!(Url::parse("http://user@h/").is_err());
 }

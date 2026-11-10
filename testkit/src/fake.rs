@@ -16,10 +16,13 @@
 //!   hang_after   after this many events, send nothing more until the client leaves
 //!
 //! Responses are taken in order: the first unused one whose `match` fits.
+//!
+//! `start_tls` serves HTTPS instead, with a certificate for 127.0.0.1 and
+//! localhost signed by a test CA made at start-up (`ca_pem`).
 
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -30,6 +33,8 @@ use std::time::{Duration, Instant};
 #[derive(Clone)]
 pub struct Request {
     pub at: Instant,
+    /// Header names in lower case, as received.
+    pub headers: Vec<(String, String)>,
     pub body: String,
 }
 
@@ -40,6 +45,38 @@ pub struct FakeModel {
     requests: Arc<Mutex<Vec<Request>>>,
     record: Option<PathBuf>,
     count: Arc<AtomicUsize>,
+    tls: Option<Arc<rustls::ServerConfig>>,
+    /// When set, each request's headers are saved there as 0001.json, …
+    record_headers: Arc<std::sync::OnceLock<PathBuf>>,
+    /// The test CA's certificate (PEM) when serving HTTPS.
+    pub ca_pem: Option<String>,
+}
+
+/// A test CA and a server certificate for 127.0.0.1 and localhost signed by it.
+fn test_tls() -> (Arc<rustls::ServerConfig>, String) {
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
+    let ca_key = KeyPair::generate().unwrap();
+    let mut ca = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca.distinguished_name
+        .push(DnType::CommonName, "shadow test CA");
+    let ca_pem = ca.self_signed(&ca_key).unwrap().pem();
+    let issuer = Issuer::new(ca, ca_key);
+    let key = KeyPair::generate().unwrap();
+    let names = vec!["127.0.0.1".to_string(), "localhost".to_string()];
+    let cert = CertificateParams::new(names)
+        .unwrap()
+        .signed_by(&key, &issuer)
+        .unwrap();
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into());
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.der().clone()], key)
+        .unwrap();
+    (Arc::new(config), ca_pem)
 }
 
 impl FakeModel {
@@ -49,6 +86,31 @@ impl FakeModel {
         port: u16,
         record: Option<PathBuf>,
     ) -> std::io::Result<FakeModel> {
+        FakeModel::listen(script, port, record, false)
+    }
+
+    /// Like `start`, over HTTPS.
+    pub fn start_tls(
+        script: Vec<Value>,
+        port: u16,
+        record: Option<PathBuf>,
+    ) -> std::io::Result<FakeModel> {
+        FakeModel::listen(script, port, record, true)
+    }
+
+    fn listen(
+        script: Vec<Value>,
+        port: u16,
+        record: Option<PathBuf>,
+        tls: bool,
+    ) -> std::io::Result<FakeModel> {
+        let (tls, ca_pem) = match tls {
+            true => {
+                let (config, pem) = test_tls();
+                (Some(config), Some(pem))
+            }
+            false => (None, None),
+        };
         let listener = TcpListener::bind(("127.0.0.1", port))?;
         if let Some(dir) = &record {
             std::fs::create_dir_all(dir)?;
@@ -59,13 +121,22 @@ impl FakeModel {
             requests: Arc::default(),
             record,
             count: Arc::default(),
+            tls,
+            ca_pem,
+            record_headers: Arc::default(),
         };
         let f = fake.clone();
         thread::spawn(move || {
             for conn in listener.incoming().flatten() {
                 let f = f.clone();
                 thread::spawn(move || {
-                    if let Err(e) = f.serve(conn) {
+                    let served = match &f.tls {
+                        Some(config) => rustls::ServerConnection::new(config.clone())
+                            .map_err(std::io::Error::other)
+                            .and_then(|tls| f.serve(rustls::StreamOwned::new(tls, conn))),
+                        None => f.serve(conn),
+                    };
+                    if let Err(e) = served {
                         eprintln!("fake-model: {e}");
                     }
                 });
@@ -74,8 +145,14 @@ impl FakeModel {
         Ok(fake)
     }
 
+    /// Saves each request's headers in `dir` as 0001.json, 0002.json, …
+    pub fn record_headers(&self, dir: PathBuf) {
+        self.record_headers.get_or_init(|| dir);
+    }
+
     pub fn url(&self) -> String {
-        format!("http://127.0.0.1:{}/v1/messages", self.port)
+        let scheme = if self.tls.is_some() { "https" } else { "http" };
+        format!("{scheme}://127.0.0.1:{}/v1/messages", self.port)
     }
 
     /// Adds responses at the end of the script.
@@ -121,9 +198,10 @@ impl FakeModel {
         None
     }
 
-    fn serve(&self, mut conn: TcpStream) -> std::io::Result<()> {
-        let mut r = BufReader::new(conn.try_clone()?);
+    fn serve(&self, conn: impl Read + Write) -> std::io::Result<()> {
+        let mut r = BufReader::new(conn);
         let mut len = 0usize;
+        let mut headers = Vec::new();
         let mut line = String::new();
         r.read_line(&mut line)?;
         let at = Instant::now();
@@ -132,10 +210,12 @@ impl FakeModel {
             if r.read_line(&mut line)? == 0 || line.trim().is_empty() {
                 break;
             }
-            if let Some((k, v)) = line.split_once(':')
-                && k.trim().eq_ignore_ascii_case("content-length")
-            {
-                len = v.trim().parse().unwrap_or(0);
+            if let Some((k, v)) = line.split_once(':') {
+                let (k, v) = (k.trim().to_ascii_lowercase(), v.trim().to_string());
+                if k == "content-length" {
+                    len = v.parse().unwrap_or(0);
+                }
+                headers.push((k, v));
             }
         }
         let mut body = vec![0; len];
@@ -145,18 +225,32 @@ impl FakeModel {
         if let Some(dir) = &self.record {
             std::fs::write(dir.join(format!("{n:04}.json")), &body)?;
         }
+        if let Some(dir) = self.record_headers.get() {
+            let names: serde_json::Map<String, Value> = headers
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone().into()))
+                .collect();
+            std::fs::create_dir_all(dir)?;
+            std::fs::write(
+                dir.join(format!("{n:04}.json")),
+                Value::Object(names).to_string(),
+            )?;
+        }
         self.requests.lock().unwrap().push(Request {
             at,
+            headers,
             body: body.clone(),
         });
+        let conn = r.get_mut();
         let Some(resp) = self.pick(&body) else {
             eprintln!("fake-model: request {n}: script exhausted");
             let msg = json!({ "type": "error", "error": { "type": "invalid_request_error", "message": "fake model: no response left in the script" } }).to_string();
-            return write!(
+            write!(
                 conn,
                 "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{msg}",
                 msg.len()
-            );
+            )?;
+            return conn.flush();
         };
         eprintln!("fake-model: request {n} answered");
         let status = resp.get("status").and_then(Value::as_u64).unwrap_or(200);
@@ -180,11 +274,12 @@ impl FakeModel {
                 Some(v) => v.to_string(),
                 None => json!({ "type": "error", "error": { "type": "api_error", "message": format!("fake status {status}") } }).to_string(),
             };
-            return write!(
+            write!(
                 conn,
                 "HTTP/1.1 {status} Fake\r\ncontent-type: application/json\r\ncontent-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
                 body.len()
-            );
+            )?;
+            return conn.flush();
         }
         write!(
             conn,
@@ -201,7 +296,7 @@ impl FakeModel {
                 let until = Instant::now() + Duration::from_secs(120);
                 while Instant::now() < until {
                     thread::sleep(Duration::from_millis(50));
-                    if chunk(&mut conn, ": waiting\n\n").is_err() {
+                    if chunk(conn, ": waiting\n\n").is_err() {
                         return Ok(());
                     }
                 }
@@ -211,13 +306,14 @@ impl FakeModel {
                 thread::sleep(delay);
             }
             let kind = ev["type"].as_str().unwrap_or("message");
-            chunk(&mut conn, &format!("event: {kind}\ndata: {ev}\n\n"))?;
+            chunk(conn, &format!("event: {kind}\ndata: {ev}\n\n"))?;
         }
-        conn.write_all(b"0\r\n\r\n")
+        conn.write_all(b"0\r\n\r\n")?;
+        conn.flush()
     }
 }
 
-fn chunk(conn: &mut TcpStream, s: &str) -> std::io::Result<()> {
+fn chunk(conn: &mut impl Write, s: &str) -> std::io::Result<()> {
     write!(conn, "{:x}\r\n{s}\r\n", s.len())?;
     conn.flush()
 }
