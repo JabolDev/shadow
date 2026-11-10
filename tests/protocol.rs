@@ -285,7 +285,7 @@ fn bad_turn_start_and_busy() {
     assert_eq!(
         bad(
             &mut e,
-            json!({ "endpoint": { "url": "https://127.0.0.1:1/x" } })
+            json!({ "endpoint": { "url": "ftp://127.0.0.1:1/x" } })
         ),
         "bad_request"
     );

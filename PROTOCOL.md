@@ -52,7 +52,7 @@ with `.`, at most 200 characters.
 | `system` | array of text blocks, sent as is |
 | `host_tools` | `[{name, description?, input_schema, parallel?}]` — tools the host runs. Sent to the model as `{name, description, input_schema}`. A name used twice, or the name of an offered native tool, is `bad_request`. |
 | `native_tools?` | names of native tools to offer (default all seven); an unknown name is `bad_request` |
-| `endpoint` | `{url, headers?}` — `url` must be `http://…`; `headers` are added to each model request |
+| `endpoint` | `{url, headers?}` — `url` is `http://…` or `https://…` (TLS with the bundled web root certificates); `headers` are added to each model request |
 | `limits?` | `max_steps` (50, ≥ 1), `bash_wait_ms` (120000), `result_cap_chars` (30000, ≥ 200), `retry_max` (6); `context_tokens` is accepted and not used yet |
 | `cache?` | `{mode: "auto" or "off", ttl?: "5m" or "1h"}`, default auto |
 | `auto_compact?` | accepted and not used yet |

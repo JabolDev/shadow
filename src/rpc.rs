@@ -1,6 +1,7 @@
 //! Protocol v1 transport: one JSON object per line on stdout. Every line the
 //! daemon writes carries "seq" (1, 2, 3 …). Requests to the host wait for the
 //! matching reply, which the stdin reader hands to `Host::on_reply`.
+//! `Host::local` is the same host inside this process (`shadow run`).
 
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
@@ -35,6 +36,34 @@ impl Host {
             pending: Arc::default(),
             next_id: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    /// A host inside this process: the lines come out of the receiver, in
+    /// order, instead of stdout; replies go in through `on_reply`.
+    pub fn local() -> (Host, mpsc::UnboundedReceiver<Map<String, Value>>) {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (lines, out) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(item) = rx.recv().await {
+                match item {
+                    Out::Line(m) => {
+                        if lines.send(m).is_err() {
+                            break;
+                        }
+                    }
+                    // The waiter may have stopped waiting; nothing to tell it then.
+                    Out::Flush(done) => {
+                        let _ = done.send(());
+                    }
+                }
+            }
+        });
+        let host = Host {
+            out: tx,
+            pending: Arc::default(),
+            next_id: Arc::new(AtomicU64::new(1)),
+        };
+        (host, out)
     }
 
     fn send(&self, obj: Map<String, Value>) {
