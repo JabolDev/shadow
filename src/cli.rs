@@ -3,6 +3,7 @@
 //! one turn, prints what happens, answers the tool checks itself and has no
 //! host tools. The model's text goes to stdout; tool lines and errors to stderr.
 
+use crate::cli_os;
 use crate::rpc::Host;
 use crate::session::{Session, now_ms, random_id, valid_id};
 use crate::{tools, turn};
@@ -12,6 +13,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::watch;
 
 const USAGE: &str = "usage: shadow run [--model NAME] [--max-tokens N] [--base-url URL] \
 [--allow edit|shell] [--yes] [--session NAME] [--data-dir DIR] \"<prompt>\"";
@@ -118,6 +120,43 @@ fn var(name: &str) -> Option<String> {
 }
 
 pub fn run(args: &[String]) -> i32 {
+    let keys = (var(ANTHROPIC.0), var(OPENROUTER.0));
+    // SAFETY: no other thread exists yet (the stderr thread and the runtime
+    // start below), so nothing reads the environment at the same time. The
+    // keys leave it so that the commands the model runs never see them.
+    unsafe {
+        std::env::remove_var(ANTHROPIC.0);
+        std::env::remove_var(OPENROUTER.0);
+    }
+    let secrets: Vec<String> = [&keys.0, &keys.1].into_iter().flatten().cloned().collect();
+    let stderr = match cli_os::redact_stderr(secrets) {
+        Ok(s) => s,
+        Err(e) => {
+            // No key can be in this line; stderr may be gone, so no panic either.
+            let _ = writeln!(std::io::stderr(), "shadow: cannot set up stderr: {e}");
+            return 1;
+        }
+    };
+    let broken = stderr.broken.clone();
+    // A panic is printed (through the redacting stderr) and still cleaned up after.
+    let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_with(args, keys, broken)
+    }))
+    .unwrap_or(101);
+    // Whatever ended the run, no process it started is left: also the ones
+    // its commands left behind.
+    cli_os::end_children();
+    match (stderr.finish(), code) {
+        (false, 0) => 1,
+        (_, code) => code,
+    }
+}
+
+fn run_with(
+    args: &[String],
+    keys: (Option<String>, Option<String>),
+    broken: watch::Receiver<bool>,
+) -> i32 {
     let opts = match parse(args) {
         Ok(Some(o)) => o,
         Ok(None) => {
@@ -129,14 +168,6 @@ pub fn run(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let keys = (var(ANTHROPIC.0), var(OPENROUTER.0));
-    // SAFETY: no other thread exists yet (the runtime starts below), so
-    // nothing reads the environment at the same time. The keys leave it so
-    // that the commands the model runs never see them.
-    unsafe {
-        std::env::remove_var(ANTHROPIC.0);
-        std::env::remove_var(OPENROUTER.0);
-    }
     // The kernel still shows the starting environment, keys included, in
     // /proc/<pid>/environ. A process that cannot be dumped hides it, and its
     // memory, from the commands the model runs (they exec, so they can be).
@@ -146,6 +177,10 @@ pub fn run(args: &[String]) -> i32 {
         if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
             let e = std::io::Error::last_os_error();
             eprintln!("shadow: cannot hide the API key from commands: {e}");
+            return 1;
+        }
+        if let Err(e) = cli_os::become_subreaper() {
+            eprintln!("shadow: cannot own the processes the run starts: {e}");
             return 1;
         }
     }
@@ -178,7 +213,7 @@ pub fn run(args: &[String]) -> i32 {
         .build()
     {
         Ok(rt) => {
-            let code = rt.block_on(go(opts, data_dir, params));
+            let code = rt.block_on(go(opts, data_dir, params, broken));
             // Everything the run started has ended; do not wait for idle threads.
             rt.shutdown_background();
             code
@@ -244,12 +279,18 @@ fn agents_md(cwd: &Path) -> Result<Option<String>, String> {
     }
 }
 
-async fn go(opts: Opts, data_dir: PathBuf, params: Value) -> i32 {
+async fn go(
+    opts: Opts,
+    data_dir: PathBuf,
+    params: Value,
+    mut broken: watch::Receiver<bool>,
+) -> i32 {
     let watch = |kind| signal(kind).map_err(|e| eprintln!("shadow: cannot watch for signals: {e}"));
-    let (Ok(mut int), Ok(mut term), Ok(mut hup)) = (
+    let (Ok(mut int), Ok(mut term), Ok(mut hup), Ok(mut child)) = (
         watch(SignalKind::interrupt()),
         watch(SignalKind::terminate()),
         watch(SignalKind::hangup()),
+        watch(SignalKind::child()),
     ) else {
         return 1;
     };
@@ -273,6 +314,7 @@ async fn go(opts: Opts, data_dir: PathBuf, params: Value) -> i32 {
         out_error: None,
     };
     let mut signalled: Option<i32> = None;
+    let mut stderr_failed = false;
     let reason = loop {
         let got = tokio::select! {
             line = lines.recv() => {
@@ -291,17 +333,34 @@ async fn go(opts: Opts, data_dir: PathBuf, params: Value) -> i32 {
             _ = int.recv(), if signalled.is_none() => Some(libc::SIGINT),
             _ = term.recv(), if signalled.is_none() => Some(libc::SIGTERM),
             _ = hup.recv(), if signalled.is_none() => Some(libc::SIGHUP),
+            _ = child.recv() => {
+                cli_os::reap_orphans();
+                None
+            }
+            Ok(_) = broken.wait_for(|b| *b), if !stderr_failed => {
+                stderr_failed = true;
+                stop(&session);
+                None
+            }
         };
         if got.is_some() {
             signalled = got;
             stop(&session);
         }
     };
-    // Whatever ended the run, nothing it started keeps running.
-    tools::kill_all(vec![session]).await;
-    match (signalled, reason.as_str(), &view.out_error) {
-        (Some(signo), _, _) => 128 + signo,
-        (None, "done", None) => 0,
+    // Whatever ended the run, nothing it started keeps running. Orphans that
+    // end meanwhile are reaped, so a stopped group is seen empty at once.
+    let cleanup = tools::kill_all(vec![session]);
+    tokio::pin!(cleanup);
+    loop {
+        tokio::select! {
+            _ = &mut cleanup => break,
+            _ = child.recv() => cli_os::reap_orphans(),
+        }
+    }
+    match (signalled, reason.as_str(), &view.out_error, stderr_failed) {
+        (Some(signo), _, _, _) => 128 + signo,
+        (None, "done", None, false) => 0,
         _ => 1,
     }
 }

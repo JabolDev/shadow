@@ -27,8 +27,9 @@ shadow run --model <model id> "why does the test in src/parse.rs fail?"
 
 The model's text goes to stdout. Each tool call, a short line for each result,
 and errors go to stderr. The exit code is 0 when the model finished, 130 after
-Ctrl-C, and not 0 for any other ending. When the run ends, every command it
-started is ended too.
+Ctrl-C, and not 0 for any other ending, including when stderr or stdout can
+no longer be written. When the run ends, every process it started is ended
+too, including processes its commands left behind.
 
 Reading and searching are always allowed. Changing files and running commands
 need permission:
@@ -60,8 +61,10 @@ The prompt is built in, and names the working folder. If the folder has an
 
 A key is always needed. Without one, Shadow stops with a one-line error. Every
 request also sends `anthropic-version: 2023-06-01`. The key is read from the
-environment only. It is never printed, logged or written to disk, and the
-commands the model runs do not see it.
+environment only, and the commands the model runs do not see it. Shadow never
+prints, logs or writes the key itself, and it removes the key from every error
+and tool line it prints. Text an endpoint sends back as the model's own answer
+is shown and stored as received.
 
 ### Variables
 

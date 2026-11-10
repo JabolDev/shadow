@@ -648,3 +648,185 @@ fn a_closed_stdout_ends_the_run_instead_of_hanging() {
         "shadow: cannot write the output (Broken pipe (os error 32)); stopping\n"
     );
 }
+
+/// Live processes whose command line contains `needle`.
+fn alive(needle: &str) -> Vec<u32> {
+    pids_with(needle)
+}
+
+#[test]
+fn f1_key_values_are_redacted_from_stderr() {
+    let or_key = "or-test-REDACT-me-7781";
+    let refused = json!({ "status": 403, "body": { "type": "error", "error": { "type": "permission_error", "message": format!("permission denied for key {KEY} on this workspace") } } });
+    // a tool line with a key in it, then the API error
+    let read = json!({ "tool_calls": [{ "name": "Read", "input": { "file_path": format!("/nonexistent/{KEY}/{or_key}.txt") } }] });
+    let fake = FakeModel::start(vec![read, refused], 0, None).unwrap();
+    let b = place("f1");
+    let o = cmd(&b, &fake.url(), &["go"])
+        .env("OPENROUTER_API_KEY", or_key)
+        .output()
+        .unwrap();
+    let (_, stderr) = out(&o);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        stderr.contains("> Read /nonexistent/[redacted]/[redacted].txt\n"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.ends_with(
+            "shadow: HTTP 403: permission denied for key [redacted] on this workspace\n"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains(KEY) && !stderr.contains(or_key),
+        "{stderr}"
+    );
+    // the OpenRouter key alone, echoed in a 401
+    let echo = json!({ "status": 401, "body": { "error": { "code": 401, "message": format!("No auth credentials found for Bearer {or_key}") } } });
+    let fake = FakeModel::start(vec![echo], 0, None).unwrap();
+    let o = cmd(&b, &fake.url(), &["go"])
+        .env_remove("ANTHROPIC_API_KEY")
+        .env("OPENROUTER_API_KEY", or_key)
+        .output()
+        .unwrap();
+    assert_eq!(
+        (o.status.code(), out(&o).1.as_str()),
+        (
+            Some(1),
+            "shadow: HTTP 401: No auth credentials found for Bearer [redacted]\n"
+        )
+    );
+}
+
+#[test]
+fn f2_a_closed_stderr_still_ends_everything() {
+    let marker = format!("sleep 67.{}", std::process::id());
+    let script = vec![
+        json!({ "tool_calls": [{ "name": "Bash", "input": { "command": marker, "run_in_background": true } }] }),
+        // the next tool line comes well after the reader has gone
+        json!({ "text": "still going", "chunk": 100, "delay_ms": 400, "tool_calls": [{ "name": "Read", "input": { "file_path": "notes.md" } }] }),
+        json!({ "text": "never" }),
+    ];
+    let fake = FakeModel::start(script, 0, None).unwrap();
+    let b = place("f2");
+    let mut child = cmd(&b, &fake.url(), &["--yes", "go"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
+    while !lines
+        .next()
+        .unwrap()
+        .unwrap()
+        .contains("running in the background")
+    {}
+    assert_eq!(alive(&marker).len(), 1);
+    drop(lines);
+    let started = Instant::now();
+    let code = child.wait().unwrap().code();
+    assert_eq!(code, Some(1), "stopped, not 0 and not a panic (101)");
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(
+        alive(&marker).is_empty(),
+        "the background command was left running"
+    );
+}
+
+#[test]
+fn f3_processes_left_behind_by_commands_are_ended() {
+    let id = std::process::id();
+    let (grandchild, daemon, orphan) = (
+        format!("sleep 68.{id}"),
+        format!("sleep 69.{id}"),
+        format!("sleep 70.{id}"),
+    );
+    let script = vec![
+        // a double-forked grandchild and a daemon in its own session, from a foreground shell that ends at once
+        json!({ "tool_calls": [{ "name": "Bash", "input": { "command": format!("( ({grandchild}; :) & ); setsid {daemon} > /dev/null 2>&1 & echo spawned") } }] }),
+        // a background shell whose leader exits before its child
+        json!({ "tool_calls": [{ "name": "Bash", "input": { "command": format!("{orphan} & echo leader-done"), "run_in_background": true } }] }),
+        // the leader's end is noted to the model, so the turn takes one more answer
+        json!({ "text": "All started.", "delay_ms": 300, "repeat": true }),
+    ];
+    let fake = FakeModel::start(script, 0, None).unwrap();
+    let b = place("f3");
+    let mut run = live(cmd(&b, &fake.url(), &["--yes", "start things"]));
+    run.wait_err("leader-done");
+    for m in [&grandchild, &daemon, &orphan] {
+        let until = Instant::now() + LONG;
+        while alive(m).is_empty() {
+            assert!(Instant::now() < until, "{m} never started");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    assert_eq!(run.exit(), 0);
+    for m in [&grandchild, &daemon, &orphan] {
+        assert!(alive(m).is_empty(), "{m} was left running");
+    }
+}
+
+/// Zombie children of `pid`.
+fn zombies_of(pid: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir("/proc").unwrap().flatten() {
+        let Ok(p) = e.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let stat = std::fs::read_to_string(e.path().join("stat")).unwrap_or_default();
+        let f: Vec<&str> = stat
+            .rsplit(')')
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .collect();
+        if f.len() > 1 && f[0] == "Z" && f[1] == pid.to_string() {
+            out.push(p);
+        }
+    }
+    out
+}
+
+#[test]
+fn f3_orphans_are_reaped_while_the_run_goes_on() {
+    let script = vec![
+        json!({ "tool_calls": [{ "name": "Bash", "input": { "command": "(sleep 0.2 &); (sleep 0.3 &); echo forked" } }] }),
+        json!({ "text": "a slow answer", "chunk": 2, "delay_ms": 150 }),
+    ];
+    let fake = FakeModel::start(script, 0, None).unwrap();
+    let b = place("f3reap");
+    let mut run = live(cmd(&b, &fake.url(), &["--yes", "fork"]));
+    run.wait_err("forked");
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(
+        run.child.try_wait().unwrap().is_none(),
+        "the run is still going"
+    );
+    assert_eq!(
+        zombies_of(run.child.id()),
+        Vec::<u32>::new(),
+        "ended orphans are reaped at once"
+    );
+    assert_eq!(run.exit(), 0);
+}
+
+#[test]
+fn f3_ending_the_run_is_not_slowed_by_orphans() {
+    let id = std::process::id();
+    let (a, b2) = (format!("sleep 71.{id}"), format!("sleep 72.{id}"));
+    let script = vec![
+        json!({ "tool_calls": [{ "name": "Bash", "input": { "command": format!("{a} & {b2}"), "run_in_background": true } }] }),
+        json!({ "text": "ok" }),
+    ];
+    let fake = FakeModel::start(script, 0, None).unwrap();
+    let b = place("f3fast");
+    let started = Instant::now();
+    let o = cmd(&b, &fake.url(), &["--yes", "go"]).output().unwrap();
+    let took = started.elapsed();
+    assert_eq!(o.status.code(), Some(0), "{}", out(&o).1);
+    // the stopped shell's orphan is reaped during the stop, so its group is
+    // seen empty at once instead of after the 2 s grace
+    assert!(took < Duration::from_millis(1500), "took {took:?}");
+    assert!(alive(&a).is_empty() && alive(&b2).is_empty());
+}

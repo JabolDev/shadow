@@ -5,6 +5,7 @@
 //!   shadow tools            prints the seven native tool definitions as JSON
 
 mod cli;
+mod cli_os;
 mod compact;
 mod http;
 mod model;
