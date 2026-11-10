@@ -399,3 +399,275 @@ fn shutdown_kills_background_commands() {
     assert_eq!(e.host.close(), Some(0));
     assert!(pids_with(&sleeper).is_empty());
 }
+
+const NOT_RUN: &str = "Not run: a message from the user arrived first. Read it, then decide again.";
+
+#[test]
+fn a_waiting_steer_stops_the_calls_that_run_alone() {
+    let mut e = Env::new("notrun", vec![], vec![]);
+    write(&e.work.join("seen.txt"), "seen\n");
+    let w = e.work.clone();
+    e.fake.push([
+        json!({ "tool_calls": [
+            { "id": "a", "name": "Bash", "input": { "command": format!("sleep 2; touch {}/a-finished", w.display()) } },
+            { "id": "b", "name": "Write", "input": { "file_path": "b-written.txt", "content": "b" } },
+            { "id": "r", "name": "Read", "input": { "file_path": "seen.txt" } },
+            { "id": "g", "name": "Glob", "input": { "pattern": "*.txt" } },
+            { "id": "c", "name": "Bash", "input": { "command": format!("touch {}/c-ran", w.display()) } },
+        ] }),
+        json!({ "text": "reading your message" }),
+    ]);
+    let turn = e.start("nr", "go", json!({}));
+    e.host
+        .wait(
+            &json!({ "method": "tool.start", "params": { "call": { "id": "a" } } }),
+            LONG,
+        )
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(250));
+    e.host.call(
+        "turn.steer",
+        json!({ "session": "nr", "id": "wait", "input": [{ "type": "text", "text": "hold on" }] }),
+    );
+    assert_eq!(e.end(&turn)["reason"], "done");
+    let results = e.fake.bodies()[1]["messages"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()["content"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let texts: Vec<String> = results
+        .iter()
+        .map(|b| text(b).lines().next().unwrap_or("").to_string())
+        .collect();
+    assert!(
+        texts[0].starts_with("Still running in the background as task "),
+        "{texts:?}"
+    );
+    assert_eq!(
+        (texts[1].as_str(), &results[1]["is_error"]),
+        (NOT_RUN, &json!(true))
+    );
+    assert_eq!(
+        texts[2], "     1\tseen",
+        "calls that run at the same time still run"
+    );
+    assert!(texts[3].ends_with("seen.txt"), "{texts:?}");
+    assert_eq!(texts[4], NOT_RUN);
+    assert_eq!(results[5]["text"], "hold on");
+    assert!(!w.join("b-written.txt").exists() && !w.join("c-ran").exists());
+    for id in ["b", "c"] {
+        assert!(
+            !e.host
+                .lines()
+                .iter()
+                .any(|l| l["params"]["call"]["id"] == id),
+            "{id} got no tool.check or tool.start"
+        );
+    }
+}
+
+#[test]
+fn a_steer_during_the_check_stops_that_call_before_it_starts() {
+    let rules = vec![
+        json!({ "method": "tool.check", "match": { "call": { "id": "first" } }, "reply": { "decision": "allow" }, "delay_ms": 600 }),
+    ];
+    let mut e = Env::new("notrun2", vec![], rules);
+    let w = e.work.clone();
+    e.fake.push([
+        json!({ "tool_calls": [
+            { "id": "first", "name": "Bash", "input": { "command": format!("touch {}/first-ran", w.display()) } },
+            { "id": "second", "name": "Edit", "input": { "file_path": "x.txt", "old_string": "a", "new_string": "b" } },
+        ] }),
+        json!({ "text": "ok" }),
+    ]);
+    let turn = e.start("n2", "go", json!({}));
+    e.host
+        .wait(
+            &json!({ "method": "tool.check", "params": { "call": { "id": "first" } } }),
+            LONG,
+        )
+        .unwrap();
+    e.host.call("turn.steer", json!({ "session": "n2", "id": 3, "input": [{ "type": "text", "text": "different plan" }] }));
+    assert_eq!(e.end(&turn)["reason"], "done");
+    let results = e.fake.bodies()[1]["messages"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()["content"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(text(&results[0]), NOT_RUN);
+    assert_eq!(text(&results[1]), NOT_RUN);
+    assert_eq!(results[2]["text"], "different plan");
+    assert!(!w.join("first-ran").exists());
+    assert!(!e.host.lines().iter().any(|l| l["method"] == "tool.start"));
+}
+
+#[test]
+fn stop_ends_a_long_search_of_one_file() {
+    let mut e = Env::new("stopgrep", vec![], vec![]);
+    // Non-ASCII letters keep the regex off its fast path: about 3 s (release) without Stop.
+    let line = "lorém ipsüm dolor sit ämet consectetur adipiscing élit sed do eiusmod 2026\n";
+    let big = e.work.join("archive.log");
+    {
+        use std::io::Write;
+        let mut f = std::io::BufWriter::new(std::fs::File::create(&big).unwrap());
+        for _ in 0..(48 * 1024 * 1024 / line.len()) {
+            f.write_all(line.as_bytes()).unwrap();
+        }
+    }
+    e.fake.push([json!({ "tool_calls": [{ "id": "gr", "name": "Grep", "input": { "pattern": "\\b\\w{6}\\s\\d{3}\\s\\w{7}\\b", "path": "archive.log", "output_mode": "count" } }] })]);
+    let pid = e.host.pid().unwrap();
+    let turn = e.start("sg", "search", json!({}));
+    e.host
+        .wait(
+            &json!({ "method": "tool.start", "params": { "call": { "id": "gr" } } }),
+            LONG,
+        )
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    let asked = Instant::now();
+    e.host.call("turn.stop", json!({ "session": "sg" }));
+    let end = e.end(&turn);
+    let took = asked.elapsed();
+    assert_eq!(end["reason"], "stopped");
+    assert!(
+        took < Duration::from_secs(1),
+        "turn.end {took:?} after turn.stop"
+    );
+    let r = e
+        .host
+        .wait_any(
+            &json!({ "method": "tool.end", "params": { "call_id": "gr" } }),
+            LONG,
+        )
+        .unwrap();
+    assert_eq!(text(&r["params"]), "Stopped by the user.");
+    // the search itself ended: the daemon is idle again
+    std::thread::sleep(Duration::from_millis(200));
+    let before = cpu_ticks(pid);
+    std::thread::sleep(Duration::from_millis(1000));
+    let used = cpu_ticks(pid) - before;
+    eprintln!(
+        "F6: turn.end {took:?} after turn.stop during Grep; daemon CPU in the next second: {used} ticks"
+    );
+    assert!(used < 20, "still searching: {used} ticks in 1 s");
+}
+
+#[test]
+fn stop_during_task_stop_ends_the_turn_and_the_kill_still_comes() {
+    let cmd = "trap '' TERM; echo stubborn; sleep 40";
+    let mut e = Env::new(
+        "stoptaskstop",
+        vec![
+            json!({ "tool_calls": [{ "id": "bg", "name": "Bash", "input": { "command": cmd, "run_in_background": true } }] }),
+            json!({ "text": "ok" }),
+        ],
+        vec![],
+    );
+    let t = e.start("sts", "start it", json!({}));
+    let first = e
+        .host
+        .wait(
+            &json!({ "method": "tool.end", "params": { "call_id": "bg" } }),
+            LONG,
+        )
+        .unwrap();
+    e.end(&t);
+    let task = first["params"]["meta"]["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    std::thread::sleep(Duration::from_millis(200));
+    e.fake.push([
+        json!({ "tool_calls": [{ "id": "ts", "name": "TaskStop", "input": { "task_id": task } }] }),
+    ]);
+    let turn = e.start("sts", "stop it", json!({}));
+    e.host
+        .wait(
+            &json!({ "method": "tool.start", "params": { "call": { "id": "ts" } } }),
+            LONG,
+        )
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let asked = Instant::now();
+    e.host.call("turn.stop", json!({ "session": "sts" }));
+    let end = e.end(&turn);
+    assert_eq!(end["reason"], "stopped");
+    assert!(
+        asked.elapsed() < Duration::from_secs(1),
+        "turn.end {:?} after turn.stop",
+        asked.elapsed()
+    );
+    // TERM is ignored; the KILL 2 s after it still ends the task
+    let upd = e.host.wait_any(&json!({ "method": "task.update", "params": { "task": { "id": task, "state": "stopped" } } }), Duration::from_secs(5)).unwrap();
+    assert_eq!(upd["params"]["task"]["exit_code"], 137);
+}
+
+#[test]
+fn a_steer_taken_before_a_failed_write_is_listed_undelivered() {
+    // Files the daemon writes may not grow past 48 KB, so the second step's
+    // results (with the steer) cannot be written to the wire log.
+    let command = vec![
+        "/bin/bash".to_string(),
+        "-c".into(),
+        "trap '' XFSZ; ulimit -f 48; exec \"$0\" serve".into(),
+        shadow_bin(),
+    ];
+    let rules = vec![
+        json!({ "method": "tool.check", "match": { "call": { "id": "r2" } }, "reply": { "decision": "allow" }, "delay_ms": 500 }),
+    ];
+    let mut host = shadow_testkit::host::ScriptedHost::start(&command, rules, false).unwrap();
+    let (data, work) = (tmpdir("efbig-data"), tmpdir("efbig-work"));
+    host.call(
+        "initialize",
+        json!({ "protocol": 1, "data_dir": data, "client": { "name": "test", "version": "1" } }),
+    );
+    let fake = shadow_testkit::fake::FakeModel::start(vec![], 0, None).unwrap();
+    let mut e = Env {
+        host,
+        fake,
+        data,
+        work,
+    };
+    for name in ["ledger-a.txt", "ledger-b.txt"] {
+        let body: String = (0..340)
+            .map(|i| format!("ledger line {i:04} {}\n", "z".repeat(55)))
+            .collect();
+        write(&e.work.join(name), &body);
+    }
+    e.fake.push([
+        json!({ "tool_calls": [{ "id": "r1", "name": "Read", "input": { "file_path": "ledger-a.txt" } }] }),
+        json!({ "tool_calls": [{ "id": "r2", "name": "Read", "input": { "file_path": "ledger-b.txt" } }] }),
+        json!({ "text": "never" }),
+    ]);
+    let turn = e.start("fw", "read both", json!({}));
+    e.host
+        .wait(
+            &json!({ "method": "tool.check", "params": { "call": { "id": "r2" } } }),
+            LONG,
+        )
+        .unwrap();
+    let r = e.host.call("turn.steer", json!({ "session": "fw", "id": "kept-1", "input": [{ "type": "text", "text": "and the summary" }] }));
+    assert_eq!(r["result"], json!({}));
+    let end = e.end(&turn);
+    assert_eq!(end["reason"], "error", "{end}");
+    assert!(
+        end["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("File too large"),
+        "{end}"
+    );
+    assert_eq!(end["undelivered"], json!(["kept-1"]));
+    assert!(
+        !e.host
+            .lines()
+            .iter()
+            .any(|l| l["method"] == "steer.delivered")
+    );
+}

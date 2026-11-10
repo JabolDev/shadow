@@ -432,3 +432,77 @@ fn thinking_and_usage_totals() {
         json!({ "type": "text", "text": "Answer." })
     );
 }
+
+#[test]
+fn invalid_tool_input_is_retried_never_run() {
+    // Attempt 1 streams a tool call whose input is cut off; attempt 2 is valid.
+    let broken = json!({ "events": [
+        json!({ "type": "message_start", "message": { "usage": { "input_tokens": 3 } } }),
+        json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "tool_use", "id": "w1", "name": "memo", "input": {} } }),
+        json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "input_json_delta", "partial_json": "{\"lines\": [\"a\", " } }),
+        json!({ "type": "content_block_stop", "index": 0 }),
+        json!({ "type": "message_delta", "delta": { "stop_reason": "tool_use" }, "usage": { "output_tokens": 2 } }),
+        json!({ "type": "message_stop" }),
+    ] });
+    let rules = vec![json!({ "method": "tool.call", "reply": { "content": "memo kept" } })];
+    let script = vec![
+        broken,
+        json!({ "tool_calls": [{ "id": "w2", "name": "memo", "input": { "lines": ["a", "b"] } }] }),
+        json!({ "text": "done" }),
+    ];
+    let mut e = Env::new("badjson", script, rules);
+    let host_tools = json!([{ "name": "memo", "description": "Keep lines", "input_schema": { "type": "object" } }]);
+    let t = e.start("bj", "write it", json!({ "host_tools": host_tools }));
+    let end = e.end(&t);
+    assert_eq!(end["reason"], "done", "{end}");
+    let calls: Vec<Value> = e
+        .host
+        .lines()
+        .into_iter()
+        .filter(|l| l["method"] == "tool.call")
+        .map(|l| l["params"]["call"].clone())
+        .collect();
+    assert_eq!(
+        calls,
+        [json!({ "id": "w2", "name": "memo", "input": { "lines": ["a", "b"] } })],
+        "only the valid call ran"
+    );
+    let retry = e
+        .host
+        .wait_any(&json!({ "method": "retry" }), Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(
+        (
+            retry["params"]["attempt"].as_u64(),
+            &retry["params"]["status"]
+        ),
+        (Some(1), &Value::Null)
+    );
+    assert!(
+        !e.wire("bj").contains("\"w1\""),
+        "the broken message is not logged"
+    );
+}
+
+#[test]
+fn split_signatures_reach_the_log_and_the_next_request() {
+    let thinking = json!({ "events": [
+        json!({ "type": "message_start", "message": { "usage": {} } }),
+        json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "thinking", "thinking": "", "signature": "" } }),
+        json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "thinking_delta", "thinking": "look first" } }),
+        json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "signature_delta", "signature": "AbC" } }),
+        json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "signature_delta", "signature": "dEf" } }),
+        json!({ "type": "content_block_stop", "index": 0 }),
+        json!({ "type": "content_block_start", "index": 1, "content_block": { "type": "tool_use", "id": "g", "name": "Glob", "input": {} } }),
+        json!({ "type": "content_block_delta", "index": 1, "delta": { "type": "input_json_delta", "partial_json": "{\"pattern\":\"*.md\"}" } }),
+        json!({ "type": "content_block_stop", "index": 1 }),
+        json!({ "type": "message_delta", "delta": { "stop_reason": "tool_use" }, "usage": { "output_tokens": 2 } }),
+        json!({ "type": "message_stop" }),
+    ] });
+    let mut e = Env::new("sig", vec![thinking, json!({ "text": "ok" })], vec![]);
+    let t = e.start("sg", "think", json!({}));
+    assert_eq!(e.end(&t)["reason"], "done");
+    let sent = &e.fake.bodies()[1]["messages"][1]["content"][0];
+    assert_eq!(sent["signature"], "AbCdEf");
+    assert!(e.wire("sg").contains("\"signature\":\"AbCdEf\""));
+}

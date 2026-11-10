@@ -309,7 +309,13 @@ pub async fn task_stop(cx: &Cx, input: &Value) -> Out {
         .iter()
         .find(|k| k.id == id)
         .map(|k| k.output.clone());
-    let head = match stop_task(session, id, true).await {
+    // Its own task: a Stop of the turn stops waiting for it, never the TERM → KILL.
+    let (s, task) = (session.clone(), id.to_string());
+    let stopping = tokio::spawn(async move { stop_task(&s, &task, true).await });
+    let Ok(outcome) = stopping.await else {
+        return Out::error(format!("shadow: internal error while stopping task {id}"));
+    };
+    let head = match outcome {
         StopOutcome::NotFound => return Out::error(format!("No background task {id}.")),
         StopOutcome::Stuck => {
             return Out::error(format!(

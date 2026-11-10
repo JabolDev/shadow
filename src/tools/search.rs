@@ -2,14 +2,15 @@
 //! `.gitignore` respected, hidden files included, `.git` skipped, names in
 //! sorted order.
 
-use super::{Cx, Out, opt_bool, opt_num, opt_str, req_str};
-use crate::turn::STOPPED;
+use super::{Cx, Out, bound_file, opt_bool, opt_num, opt_str, req_str};
+use crate::turn::{STOPPED, Turn};
 use globset::GlobBuilder;
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
 use ignore::WalkBuilder;
 use serde_json::Value;
-use std::io;
+use std::fs::File;
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -106,9 +107,13 @@ fn run_grep(cx: &Cx, input: &Value) -> Result<Out, String> {
         mode,
         numbers: opt_bool(input, "-n")?,
         room: limit,
-        chars: cx.cap(),
-        lines: Vec::new(),
+        shown: 0,
         more: 0,
+        out: String::new(),
+        spill: None,
+        spill_at: (4 * cx.cap()).max(1 << 20),
+        spill_path: cx.overflow_path().with_extension("part"),
+        err: None,
         path: String::new(),
         count: 0,
     };
@@ -134,7 +139,14 @@ fn run_grep(cx: &Cx, input: &Value) -> Result<Out, String> {
         }
         c.path = file.display().to_string();
         c.count = 0;
-        if searcher.search_path(&matcher, &file, &mut c).is_err() {
+        let found = File::open(&file).and_then(|f| {
+            let reader = StopRead {
+                file: f,
+                turn: &cx.turn,
+            };
+            searcher.search_reader(&matcher, reader, &mut c)
+        });
+        if found.is_err() {
             failed += 1;
             continue;
         }
@@ -147,52 +159,119 @@ fn run_grep(cx: &Cx, input: &Value) -> Result<Out, String> {
             }
         }
     }
-    let mut text = if c.lines.is_empty() && c.more == 0 {
-        if mode == Mode::Files {
-            "No files found".to_string()
-        } else {
-            "No matches found".to_string()
-        }
-    } else if mode == Mode::Files {
-        format!(
-            "Found {files_found} file{}\n{}",
-            if files_found == 1 { "" } else { "s" },
-            c.lines.join("\n")
-        )
-    } else {
-        c.lines.join("\n")
+    if cx.turn.stopped() {
+        return Err(STOPPED.into());
+    }
+    if let Some(e) = c.err.take() {
+        return Err(format!("Cannot write the overflow file: {e}"));
+    }
+    let head = match (c.shown + c.more, mode) {
+        (0, Mode::Files) => "No files found".to_string(),
+        (0, _) => "No matches found".to_string(),
+        (_, Mode::Files) => format!(
+            "Found {files_found} file{}",
+            if files_found == 1 { "" } else { "s" }
+        ),
+        _ => String::new(),
     };
+    let mut foot = String::new();
     if c.more > 0 {
-        text.push_str(&format!("\n({} more not shown)", c.more));
+        foot.push_str(&format!("({} more not shown)\n", c.more));
     }
     if failed > 0 {
-        text.push_str(&format!("\n({failed} paths could not be read)"));
+        foot.push_str(&format!("({failed} paths could not be read)\n"));
     }
-    Ok(Out::text(text))
+    let io_err = |e: io::Error| format!("Cannot write the overflow file: {e}");
+    let Some((part, f)) = c.spill.take() else {
+        let parts = [head.as_str(), c.out.trim_end(), foot.trim_end()];
+        let text = parts
+            .into_iter()
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Ok(Out::bounded(cx.bound(&text).map_err(io_err)?, false));
+    };
+    // Too long to keep in memory: the full text is assembled in the overflow file.
+    let path = cx.overflow_path();
+    let assemble = || -> io::Result<()> {
+        f.into_inner().map_err(|e| e.into_error())?;
+        let mut out = BufWriter::new(File::create(&path)?);
+        if !head.is_empty() {
+            writeln!(out, "{head}")?;
+        }
+        io::copy(&mut File::open(&part)?, &mut out)?;
+        out.write_all(foot.trim_end().as_bytes())?;
+        out.flush()?;
+        std::fs::remove_file(&part)
+    };
+    assemble().map_err(io_err)?;
+    Ok(Out::bounded(
+        bound_file(&path, cx.cap(), &path).map_err(io_err)?,
+        false,
+    ))
 }
 
-/// Collects output lines within the entry limit and the cap; counts the rest.
+/// A file that reads nothing more once the turn is stopped, so a long
+/// search of one file ends with the turn.
+struct StopRead<'a> {
+    file: File,
+    turn: &'a Turn,
+}
+
+impl Read for StopRead<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.turn.stopped() {
+            return Err(io::Error::other(STOPPED));
+        }
+        self.file.read(buf)
+    }
+}
+
+/// Collects output lines within the entry limit; past a size they are
+/// streamed to a file instead of kept in memory.
 struct Collect {
     mode: Mode,
     numbers: bool,
     room: usize,
-    chars: usize,
-    lines: Vec<String>,
+    shown: usize,
     more: usize,
+    out: String,
+    spill: Option<(PathBuf, BufWriter<File>)>,
+    spill_at: usize,
+    spill_path: PathBuf,
+    err: Option<io::Error>,
     path: String,
     count: usize,
 }
 
 impl Collect {
     fn push(&mut self, line: String) {
-        let len = line.chars().count() + 1;
-        if self.lines.len() < self.room && len <= self.chars {
-            self.chars -= len;
-            self.lines.push(line);
-        } else {
-            self.room = self.lines.len();
+        if self.shown >= self.room {
             self.more += 1;
+            return;
         }
+        self.shown += 1;
+        if let Err(e) = self.keep(&line) {
+            self.err.get_or_insert(e);
+        }
+    }
+
+    fn keep(&mut self, line: &str) -> io::Result<()> {
+        if let Some((_, f)) = &mut self.spill {
+            return writeln!(f, "{line}");
+        }
+        self.out.push_str(line);
+        self.out.push('\n');
+        if self.out.len() > self.spill_at {
+            if let Some(dir) = self.spill_path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let mut f = BufWriter::new(File::create(&self.spill_path)?);
+            f.write_all(self.out.as_bytes())?;
+            self.out = String::new();
+            self.spill = Some((self.spill_path.clone(), f));
+        }
+        Ok(())
     }
 
     fn add(&mut self, first: Option<u64>, bytes: &[u8]) {
@@ -218,14 +297,14 @@ impl Sink for Collect {
             Mode::Count => {}
             Mode::Content => self.add(m.line_number(), m.bytes()),
         }
-        Ok(true)
+        Ok(self.err.is_none())
     }
 
     fn context(&mut self, _: &Searcher, c: &SinkContext<'_>) -> Result<bool, io::Error> {
         if self.mode == Mode::Content {
             self.add(c.line_number(), c.bytes());
         }
-        Ok(true)
+        Ok(self.err.is_none())
     }
 }
 
@@ -299,7 +378,10 @@ fn run_glob(cx: &Cx, input: &Value) -> Result<Out, String> {
     if failed > 0 {
         text.push_str(&format!("\n({failed} paths could not be read)"));
     }
-    Ok(Out::text(text))
+    let bounded = cx
+        .bound(&text)
+        .map_err(|e| format!("Cannot write the overflow file: {e}"))?;
+    Ok(Out::bounded(bounded, false))
 }
 
 /// Keeps the newest MAX_GLOB, newest first (then by path).

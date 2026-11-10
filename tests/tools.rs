@@ -549,22 +549,79 @@ fn grep_finds_with_ripgrep_rules() {
 }
 
 #[test]
-fn grep_bounded_by_the_cap() {
+fn grep_and_glob_results_are_cut_like_every_tool() {
     let mut e = Env::new("grepcap", vec![], vec![]);
-    let body: String = (0..5000).map(|i| format!("match number {i}\n")).collect();
-    write(&e.work.join("many.txt"), &body);
+    let body: String = (0..3000)
+        .map(|i| format!("entry {i:05} of the ledger\n"))
+        .collect();
+    write(&e.work.join("ledger.txt"), &body);
+    // over the cap: first part, last part, the marker, the full text in the overflow file
     let r = e.tool(
         "gc",
         "Grep",
-        json!({ "pattern": "match", "output_mode": "content" }),
+        json!({ "pattern": "ledger", "output_mode": "content", "-n": true }),
     );
     let out = text(&r);
-    assert!(out.chars().count() <= 30_000 + 40);
-    let shown = out.lines().count() - 1;
-    assert_eq!(
-        out.lines().last().unwrap(),
-        format!("({} more not shown)", 5000 - shown)
+    assert!(out.chars().count() <= 30_000, "{}", out.chars().count());
+    let path = r["meta"]["overflow_path"].as_str().unwrap().to_string();
+    assert!(
+        out.contains(&format!(" lines omitted. Full output: {path}]")),
+        "{}",
+        &out[..200]
     );
+    assert!(
+        out.ends_with(":3000:entry 02999 of the ledger"),
+        "the last part is kept"
+    );
+    let full = fs::read_to_string(&path).unwrap();
+    assert_eq!(full.lines().count(), 3000);
+    assert!(full.lines().all(|l| l.contains(":entry ")));
+    // head_limit keeps its own count, and the whole list spills to a file when it is large
+    let wide: String = (0..40_000)
+        .map(|i| format!("row {i:06} {}\n", "w".repeat(30)))
+        .collect();
+    write(&e.work.join("wide.txt"), &wide);
+    let r = e.tool("gc", "Grep", json!({ "pattern": "^row", "path": "wide.txt", "output_mode": "content", "head_limit": 35_000 }));
+    let out = text(&r);
+    assert!(out.chars().count() <= 30_000);
+    assert_eq!(out.lines().last().unwrap(), "(5000 more not shown)");
+    let path = r["meta"]["overflow_path"].as_str().unwrap().to_string();
+    let full = fs::read_to_string(&path).unwrap();
+    assert_eq!(full.lines().count(), 35_001);
+    assert!(
+        full.lines()
+            .nth(34_999)
+            .unwrap()
+            .ends_with(&format!("row 034999 {}", "w".repeat(30)))
+    );
+    assert!(
+        !fs::read_dir(e.data.join("sessions/gc/scratch"))
+            .unwrap()
+            .any(|f| f.unwrap().path().extension().is_some_and(|x| x == "part"))
+    );
+    // Glob within a small cap
+    for i in 0..40 {
+        write(&e.work.join(format!("many/deeper/name-{i:02}.txt")), "x");
+    }
+    e.fake.push([json!({ "tool_calls": [{ "id": "gl", "name": "Glob", "input": { "pattern": "many/**/*.txt" } }] }), json!({ "text": "ok" })]);
+    let t = e.start(
+        "gc",
+        "list",
+        json!({ "limits": { "result_cap_chars": 400 } }),
+    );
+    e.end(&t);
+    let r = e
+        .host
+        .wait_any(
+            &json!({ "method": "tool.end", "params": { "call_id": "gl" } }),
+            LONG,
+        )
+        .unwrap()["params"]
+        .clone();
+    let out = text(&r);
+    assert!(out.chars().count() <= 400, "{}", out.chars().count());
+    let full = fs::read_to_string(r["meta"]["overflow_path"].as_str().unwrap()).unwrap();
+    assert_eq!(full.lines().count(), 40);
 }
 
 #[test]

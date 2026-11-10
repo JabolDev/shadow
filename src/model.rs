@@ -208,7 +208,7 @@ impl Assembler {
                 match s("type") {
                     "text_delta" => append(b, "text", s("text")),
                     "thinking_delta" => append(b, "thinking", s("thinking")),
-                    "signature_delta" => b.value["signature"] = Value::from(s("signature")),
+                    "signature_delta" => append(b, "signature", s("signature")),
                     "input_json_delta" => b.json.push_str(s("partial_json")),
                     "citations_delta" => {
                         let c = d.get("citation").cloned().unwrap_or_default();
@@ -223,8 +223,10 @@ impl Assembler {
             "content_block_stop" => {
                 if let Some(Some(b)) = self.blocks.get_mut(index) {
                     if !b.json.trim().is_empty() {
-                        b.value["input"] =
-                            serde_json::from_str(&b.json).unwrap_or_else(|_| json!({}));
+                        // Input that is not valid JSON breaks the message: the step is retried.
+                        b.value["input"] = serde_json::from_str(&b.json).map_err(|e| {
+                            format!("the tool input of block {index} is not valid JSON: {e}")
+                        })?;
                     }
                     b.complete = true;
                 }

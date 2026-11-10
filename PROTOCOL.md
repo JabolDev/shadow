@@ -31,7 +31,7 @@ Error codes: `bad_request`, `busy`, `not_initialized`, `unknown_method`,
 | `session.info` | `session` | `{exists, cursor, messages, last_model_call_at, running, tasks}` — `messages`: messages in the context (after the last compaction); `last_model_call_at`: ms since the epoch or null; `tasks`: running background tasks. |
 | `turn.start` | see below | `{turn}` at once (a 16-hex-digit id), before any notification of the turn. `busy` while a turn or a compaction runs in that chat; `bad_request` for bad params. |
 | `turn.steer` | `session`, `id` (string or number), `input` (content blocks) | `{}`. Later `steer.delivered {id}`, or the id in `turn.end.undelivered`. `not_running` when no turn runs. |
-| `turn.stop` | `session` | `{}`. The stream is cancelled, the waiting foreground command's process group gets TERM (KILL 0.5 s later), `turn.end` with reason `stopped` follows within 1 s. Background commands keep running. |
+| `turn.stop` | `session` | `{}`. The stream is cancelled, the waiting foreground command's process group gets TERM (KILL 0.5 s later), `turn.end` with reason `stopped` follows within 1 s whatever native tool runs (a Grep stops reading; a TaskStop's TERM → KILL goes on). Background commands keep running. |
 | `task.list` | `session` | `{tasks: [{id, command, state, exit_code, started_at, output_path}]}` — background tasks; `started_at` in ms since the epoch. |
 | `task.stop` | `session`, `task` | `{stopped}` — true when the task was running and has now ended (TERM, KILL after 2 s). |
 | `session.compact` | `session`, `model`, `endpoint`, `request?`, `system?`, `prompt?` | `{summary, messages_before, messages_after}`. Notifications `compaction {state: start}`, then `done` or `failed`. On failure: error `compaction_failed`, the wire log is unchanged. |
@@ -72,7 +72,7 @@ with `.`, at most 200 characters.
 | `steer.delivered` | `id` |
 | `retry` | `step`, `attempt`, `wait_ms`, `status` (null for a connection error or a broken stream) |
 | `compaction` | `state: start, done or failed` |
-| `turn.end` | `reason: done, stopped, max_steps or error`, `error?: {message, status?, body?}`, `steps`, `usage` (sums of the steps' numeric usage fields), `undelivered` (steer ids), `cursor` |
+| `turn.end` | `reason: done, stopped, max_steps or error`, `error?: {message, status?, body?}`, `steps`, `usage` (sums of the steps' numeric usage fields), `undelivered` (ids of every accepted steer not delivered, whatever the reason), `cursor` |
 
 ## Daemon → host requests
 
@@ -107,18 +107,26 @@ result `No such tool: <name>` and no request at all.
    ended, then waiting steer messages in arrival order (each followed by
    `steer.delivered`).
 6. A foreground command moves to the background at once when a steer is
-   waiting.
+   waiting. From the moment a steer is waiting, no further call that runs
+   alone (Write, Edit, Bash, TaskStop, host tools not marked `parallel`) is
+   started in that step: each gets the error result `Not run: a message from
+   the user arrived first. Read it, then decide again.` and no `tool.check`
+   or `tool.start` (or, when its `tool.check` was already out, no
+   `tool.start`). Read, Grep, Glob and `parallel` host tools still run. Task
+   notes do not count.
 7. The turn ends when the model's message has no tool call (`done`), on Stop
    (`stopped`), after the results of step `max_steps` (`max_steps`), or on an
    error retries cannot fix (`error`). If steers or task notes wait when the
    model's message has no tool call (and `max_steps` is not reached), they
-   become a new user message and the turn goes on. Steers left when the turn
-   ends are listed in `undelivered`. An assistant message with no content
+   become a new user message and the turn goes on. Steers not delivered when
+   the turn ends — still waiting, or taken for a write that failed — are
+   listed in `undelivered`. An assistant message with no content
    block is not logged.
 8. Retries: status 429, 500, 502, 503, 504, 529, connection errors, and a
-   stream that breaks or reports an `error` event (the partial message is
-   dropped), up to `retry_max` times; waits 1 s, 2 s, 4 s … up to 30 s, or the
-   response's `retry-after` (seconds). Any other status ends the turn with
+   stream that breaks, reports an `error` event, or carries tool input that
+   is not valid JSON (the partial message is dropped; no tool runs), up to
+   `retry_max` times; waits 1 s, 2 s, 4 s … up to 30 s, or the response's
+   `retry-after` (seconds). Any other status ends the turn with
    `error: {message, status, body}`.
 9. Stop mid-stream: complete blocks are kept and logged, incomplete ones
    dropped; tool calls that did not run get the error result
@@ -145,8 +153,8 @@ result `No such tool: <name>` and no request at all.
 | `Edit` | `file_path` + `old_string`, `new_string`, `replace_all?` — or `edits: [{old_string, new_string, replace_all?}]` | Needs the current version in the version table. Changed since seen: the unified diff seen → now (at most 200 lines); if it all fitted, the new version counts as seen. Not found: the nearest near-match (similarity ≥ 0.6) with its line number. Not unique: the line of every match (at most 20). `edits` apply in order, all or nothing. Temp file + rename; keeps mode, CRLF line endings (when every line has one) and whether the file ends with a newline. Result: changed lines with new line numbers and 3 lines around. |
 | `Bash` | `command`, `description?`, `timeout?` (ms, max 600000), `run_in_background?` | `/bin/bash -c` in `cwd`, own process group, stdin `/dev/null`, stdout+stderr in `<scratch>/tasks/<task id>.log`. Waits `timeout` or `bash_wait_ms`. Ended: bounded output, `Exit code N` when not 0 (128+signal when killed), `(no output)` when empty. At the limit, with `run_in_background`, or when a steer waits: a background task — output so far plus `Still running in the background as task <id>. Output: <path>. You will be told when it ends.` Never killed by the limit. When a background task ends: `task.update`, and while a turn runs a note `Background task <id> (<command>) ended: exit N. Output: <path>` (none when TaskStop stopped it). |
 | `TaskStop` | `task_id` | TERM to the task's process group, KILL after 2 s; result: its last 20 lines. |
-| `Grep` | `pattern`, `path?`, `glob?`, `output_mode?` (`files_with_matches`, `content`, `count`), `-i?`, `-n?`, `-A?`, `-B?`, `-C?`, `head_limit?`, `multiline?` | ripgrep's crates. `.gitignore` respected, hidden files searched, `.git` skipped, binary files skipped, files in name order. Output within `head_limit` and the cap, then `(N more not shown)`. |
-| `Glob` | `pattern`, `path?` | Same walk as Grep; `*` stays within one folder, `**` crosses folders, `{a,b}` alternatives. Newest first, at most 100, then `(N more not shown)`. |
+| `Grep` | `pattern`, `path?`, `glob?`, `output_mode?` (`files_with_matches`, `content`, `count`), `-i?`, `-n?`, `-A?`, `-B?`, `-C?`, `head_limit?`, `multiline?` | ripgrep's crates. `.gitignore` respected, hidden files searched, `.git` skipped, binary files skipped, files in name order. Entries within `head_limit`, then `(N more not shown)`; the whole result is cut to the cap like every tool (a long list goes to the overflow file, not into memory). |
+| `Glob` | `pattern`, `path?` | Same walk as Grep; `*` stays within one folder, `**` crosses folders, `{a,b}` alternatives. Newest first, at most 100, then `(N more not shown)`; cut to the cap like every tool. |
 
 ## Files
 

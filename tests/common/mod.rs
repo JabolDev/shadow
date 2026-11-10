@@ -237,6 +237,21 @@ pub fn group_members(pgid: u32) -> Vec<u32> {
     out
 }
 
+/// CPU time a process used so far, in clock ticks (user + system).
+pub fn cpu_ticks(pid: u32) -> u64 {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let rest: Vec<u64> = stat
+        .rsplit(')')
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .skip(11)
+        .take(2)
+        .map(|n| n.parse().unwrap())
+        .collect();
+    rest[0] + rest[1]
+}
+
 /// Resident memory of a process in kB.
 pub fn rss_kb(pid: u32) -> u64 {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();

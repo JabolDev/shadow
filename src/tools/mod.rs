@@ -320,9 +320,12 @@ pub fn bound_file(path: &Path, cap: usize, overflow: &Path) -> io::Result<Bounde
         total += buf[..n].iter().filter(|&&b| b == b'\n').count();
     }
     let total = total + usize::from(!tail.ends_with(b"\n"));
-    write_overflow(overflow, |out| {
-        io::copy(&mut fs::File::open(path)?, out).map(drop)
-    })?;
+    // The overflow file may be this file itself (Grep assembles it there).
+    if path != overflow {
+        write_overflow(overflow, |out| {
+            io::copy(&mut fs::File::open(path)?, out).map(drop)
+        })?;
+    }
     let head = String::from_utf8_lossy(&head);
     let tail = String::from_utf8_lossy(&tail);
     let mut head_lines: Vec<&str> = head.split('\n').collect();

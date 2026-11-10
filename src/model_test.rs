@@ -140,3 +140,38 @@ fn body_splices_messages_and_marks_the_ends() {
         String::from_utf8(super::body("m", None, &[], &[s], &Map::new(), Some(&cache))).unwrap();
     assert!(!b.contains("cache_control"));
 }
+
+#[test]
+fn invalid_tool_input_breaks_the_message() {
+    let mut a = Assembler::default();
+    feed(
+        &mut a,
+        &[
+            json!({ "type": "message_start", "message": { "usage": {} } }),
+            json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "tool_use", "id": "t", "name": "Write", "input": {} } }),
+            json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "input_json_delta", "partial_json": "{\"file_path\": \"x\", \"content\": [1," } }),
+        ],
+    );
+    let err = a
+        .on_event(&json!({ "type": "content_block_stop", "index": 0 }))
+        .unwrap_err();
+    assert!(err.contains("not valid JSON"), "{err}");
+    assert_eq!(a.message(), None, "the block is not complete, nothing runs");
+}
+
+#[test]
+fn signature_fragments_are_joined() {
+    let mut a = Assembler::default();
+    feed(
+        &mut a,
+        &[
+            json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "thinking", "thinking": "", "signature": "" } }),
+            json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "thinking_delta", "thinking": "hm" } }),
+            json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "signature_delta", "signature": "Eq1" } }),
+            json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "signature_delta", "signature": "x+/" } }),
+            json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "signature_delta", "signature": "9==" } }),
+            json!({ "type": "content_block_stop", "index": 0 }),
+        ],
+    );
+    assert_eq!(a.message().unwrap()["content"][0]["signature"], "Eq1x+/9==");
+}

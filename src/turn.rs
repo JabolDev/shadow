@@ -19,6 +19,7 @@ use std::time::Instant;
 use tokio::sync::{oneshot, watch};
 
 pub const STOPPED: &str = "Stopped by the user.";
+const NOT_RUN: &str = "Not run: a message from the user arrived first. Read it, then decide again.";
 const RESERVED: [&str; 5] = ["model", "system", "tools", "messages", "stream"];
 
 pub struct Limits {
@@ -57,6 +58,8 @@ pub struct Turn {
     steps: AtomicU64,
     usage: Mutex<Map<String, Value>>,
     cursor: Mutex<Option<String>>,
+    /// Ids of steers taken from the queue whose `steer.delivered` is not sent yet.
+    taken: Mutex<Vec<Value>>,
 }
 
 /// What the turn appends before its first model call.
@@ -267,6 +270,7 @@ pub fn start(
         steps: AtomicU64::new(0),
         usage: Mutex::new(Map::new()),
         cursor: Mutex::new(None),
+        taken: Mutex::new(Vec::new()),
     };
     Ok((
         Arc::new(turn),
@@ -427,7 +431,7 @@ async fn drive(t: &Arc<Turn>, start: Start) -> io::Result<Option<End>> {
         let inbox = if stopped {
             Inbox::default()
         } else {
-            t.session.take_inbox(&t.id)
+            t.take_inbox()
         };
         content.extend(inbox.blocks());
         wire.push_message(&json!({ "role": "user", "content": content }));
@@ -490,6 +494,11 @@ enum Pending {
 }
 
 fn begin(t: &Turn, step: u64, c: &Call) -> Pending {
+    let known =
+        t.native.contains(&c.name.as_str()) || t.host_tools.iter().any(|h| h.name == c.name);
+    if known && !t.parallel(&c.name) && t.steer_waiting() {
+        return Pending::Done(error_result(&c.id, NOT_RUN));
+    }
     if t.host_tools.iter().any(|h| h.name == c.name) {
         t.emit(
             "tool.start",
@@ -554,9 +563,18 @@ async fn finish(t: Arc<Turn>, step: u64, c: Call, first: Pending) -> Value {
             );
         }
     };
+    if !t.parallel(&c.name) && t.steer_waiting() {
+        return error_result(&c.id, NOT_RUN);
+    }
     t.emit("tool.start", json!({ "step": step, "call": { "id": c.id, "name": c.name, "input": input }, "native": true }));
     let started = Instant::now();
-    let out = tools::run(&t, &c.id, &c.name, &input).await;
+    let mut stop = t.stop.clone();
+    // Stop ends the wait for any tool; Bash, polled first, handles Stop itself.
+    let out = tokio::select! {
+        biased;
+        out = tools::run(&t, &c.id, &c.name, &input) => out,
+        _ = stop.wait_for(|s| *s) => tools::Out::error(STOPPED),
+    };
     let meta = out.meta_json(started.elapsed().as_millis() as u64);
     let content = Value::Array(out.content);
     let end = t.ask(
@@ -615,6 +633,17 @@ impl Turn {
         }
     }
 
+    fn steer_waiting(&self) -> bool {
+        *self.waiting.borrow() > 0
+    }
+
+    /// Steers and notes for a step boundary; the steers count as taken until delivered.
+    fn take_inbox(&self) -> Inbox {
+        let inbox = self.session.take_inbox(&self.id);
+        lock(&self.taken).extend(inbox.steers.iter().map(|s| s.id.clone()));
+        inbox
+    }
+
     fn parallel(&self, name: &str) -> bool {
         (matches!(name, "Read" | "Grep" | "Glob") && self.native.contains(&name))
             || self.host_tools.iter().any(|h| h.name == name && h.parallel)
@@ -649,8 +678,10 @@ impl Turn {
     }
 
     fn delivered(&self, inbox: &Inbox) {
+        let mut taken = lock(&self.taken);
         for Steer { id, .. } in &inbox.steers {
             self.emit("steer.delivered", json!({ "id": id }));
+            taken.retain(|t| t != id);
         }
     }
 
@@ -664,9 +695,11 @@ impl Turn {
                 && (!ctl.steers.is_empty() || !ctl.notes.is_empty())
             {
                 ctl.waiting.send_replace(0);
+                let steers = std::mem::take(&mut ctl.steers);
+                lock(&self.taken).extend(steers.iter().map(|s| s.id.clone()));
                 return Some(Inbox {
                     notes: std::mem::take(&mut ctl.notes),
-                    steers: std::mem::take(&mut ctl.steers),
+                    steers,
                 });
             }
         }
@@ -674,14 +707,15 @@ impl Turn {
         None
     }
 
-    /// Sends `turn.end`; steers still waiting are listed as undelivered.
+    /// Sends `turn.end`; every accepted steer not delivered (taken from the
+    /// queue or still in it) is listed as undelivered.
     fn finish(&self, end: End) {
         self.save_versions();
         let mut st = self.session.lock();
-        let undelivered: Vec<Value> = match st.turn.take_if(|c| c.id == self.id) {
-            Some(ctl) => ctl.steers.into_iter().map(|s| s.id).collect(),
-            None => Vec::new(),
-        };
+        let mut undelivered: Vec<Value> = std::mem::take(&mut *lock(&self.taken));
+        if let Some(ctl) = st.turn.take_if(|c| c.id == self.id) {
+            undelivered.extend(ctl.steers.into_iter().map(|s| s.id));
+        }
         let mut params = json!({
             "reason": end.reason,
             "steps": self.steps.load(Ordering::Relaxed),
