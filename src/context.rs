@@ -16,6 +16,8 @@ const RECENT_STEPS: u64 = 10;
 /// Results shorter than this are never faded.
 const MIN_FADE_CHARS: usize = 2000;
 const GAUGE: &str = "\"text\":\"Context: ";
+/// The loop breaker's line, before its step number.
+const REPEATED: &str = "Unchanged. You already have this result (step ";
 const MINUTE: u64 = 60_000;
 
 /// What a turn's context engine works with.
@@ -58,6 +60,11 @@ struct Item {
     image: bool,
     /// A Read whose result shows the file: the file's path.
     view: Option<String>,
+    /// The result is one line instead of the text: Read's "Unchanged since
+    /// step …" or the loop breaker's line.
+    one_line: bool,
+    /// The loop breaker's line: the step whose result holds the text.
+    repeat_of: Option<u64>,
     content: Value,
 }
 
@@ -85,10 +92,13 @@ fn items(messages: &[String], cwd: &Path) -> Vec<Item> {
             };
             let (chars, lines, image) = measure(&b["content"]);
             let is_error = b["is_error"] == true;
-            let view = (name == "Read"
-                && !is_error
-                && !text_of(&b["content"]).starts_with(UNCHANGED_SINCE))
-            .then(|| {
+            let text = text_of(&b["content"]);
+            let repeat_of = text
+                .strip_prefix(REPEATED)
+                .and_then(|r| r.strip_suffix(")."))
+                .and_then(|n| n.parse().ok());
+            let one_line = repeat_of.is_some() || text.starts_with(UNCHANGED_SINCE);
+            let view = (name == "Read" && !is_error && !one_line).then(|| {
                 let path = input["file_path"].as_str().unwrap_or_default();
                 resolve(cwd, path).to_string_lossy().into_owned()
             });
@@ -102,6 +112,8 @@ fn items(messages: &[String], cwd: &Path) -> Vec<Item> {
                 lines,
                 image,
                 view,
+                one_line,
+                repeat_of,
                 content: b["content"].clone(),
             });
         }
@@ -149,12 +161,26 @@ fn text_of(content: &Value) -> String {
     }
 }
 
+/// The result that holds the real newest result of host tool `name`: its
+/// newest call's, or the one the loop breaker pointed that call to.
+fn kept<'a>(items: &'a [Item], name: &str) -> Option<&'a Item> {
+    let newest = items.iter().rev().find(|i| i.name == name)?;
+    let Some(step) = newest.repeat_of else {
+        return Some(newest);
+    };
+    items.iter().find(|i| {
+        i.name == name && i.input == newest.input && i.step == step && i.repeat_of.is_none()
+    })
+}
+
 /// A fade: the stub of each faded call, the Reads (path, step) whose lines
-/// are no longer above, and the context's size after it.
+/// are no longer above, the context's size after it, and the tokens all
+/// candidates together would free.
 pub struct Fade {
     pub stubs: Map<String, Value>,
     pub reads: Vec<(String, u64)>,
     pub size: u64,
+    pub worth: u64,
 }
 
 /// Plans a fade of the context (its size plus `extra` tokens not logged
@@ -170,6 +196,11 @@ pub fn fade(
     down_to: Option<u64>,
 ) -> Fade {
     let items = items(&wire.messages, cwd);
+    let kept_ids: Vec<&str> = keep
+        .iter()
+        .filter_map(|n| kept(&items, n))
+        .map(|i| i.id.as_str())
+        .collect();
     let mut cands: Vec<(bool, &Item)> = Vec::new();
     for (i, it) in items.iter().enumerate() {
         let later = &items[i + 1..];
@@ -177,19 +208,19 @@ pub fn fade(
             .view
             .as_ref()
             .is_some_and(|p| !later.iter().any(|l| l.view.as_ref() == Some(p)));
-        let newest_kept = keep.contains(&it.name) && !later.iter().any(|l| l.name == it.name);
         if it.step + RECENT_STEPS > wire.assistant_count
             || it.chars < MIN_FADE_CHARS
             || wire.faded.contains(&it.id)
             || newest_view
-            || newest_kept
+            || kept_ids.contains(&it.id.as_str())
         {
             continue;
         }
+        // A one-line answer holds no text: it supersedes nothing.
         let superseded = it.view.is_some()
             || later
                 .iter()
-                .any(|l| l.name == it.name && l.input == it.input);
+                .any(|l| l.name == it.name && l.input == it.input && !l.one_line);
         cands.push((superseded, it));
     }
     cands.sort_by(|a, b| {
@@ -201,13 +232,15 @@ pub fn fade(
         stubs: Map::new(),
         reads: Vec::new(),
         size: wire.size() + extra,
+        worth: 0,
     };
     for (_, it) in cands {
-        if down_to.is_some_and(|t| f.size <= t) {
-            break;
-        }
         let stub = stub(it, scratch);
         let saved = it.chars.saturating_sub(stub.chars().count()) as u64 / 4;
+        f.worth += saved;
+        if down_to.is_some_and(|t| f.size <= t) {
+            continue;
+        }
         f.size = f.size.saturating_sub(saved);
         if let Some(p) = &it.view {
             f.reads.push((p.clone(), it.step));
@@ -250,16 +283,16 @@ fn stub(it: &Item, scratch: &Path) -> String {
 
 /// The ledger of a compaction of `messages`, and its text for the summary
 /// message: every file changed with Write or Edit (with the earlier
-/// ledger's), the background commands still running, and the newest call of
-/// each `keep_latest` host tool, word for word within `cap`. None when it is
-/// empty.
+/// ledger's), the background commands still running, and the real result of
+/// the newest call of each `keep_latest` host tool, word for word within
+/// `cap`. None when it is empty; Err when an overflow file cannot be written.
 pub fn ledger(
     messages: &[String],
     earlier: Option<&Value>,
     session: &Session,
     keep: &[String],
     cap: usize,
-) -> Option<(Value, String)> {
+) -> Result<Option<(Value, String)>, String> {
     let items = items(messages, Path::new("/"));
     let mut files: Vec<String> = earlier
         .and_then(|l| l["files"].as_array())
@@ -281,13 +314,17 @@ pub fn ledger(
     }
     let mut latest: Vec<Value> = Vec::new();
     for name in keep {
-        let newest = items.iter().rev().find(|i| &i.name == name).map(|it| {
-            let text = text_of(&it.content);
+        let mut newest = None;
+        if let Some(it) = kept(&items, name) {
             let file = tools::overflow_file(&session.scratch(), &it.id);
-            let text = tools::bound(&text, cap, &file)
-                .map_or_else(|_| text.chars().take(cap).collect(), |b| b.text);
-            json!({ "name": name, "input": it.input, "result": text })
-        });
+            let text = tools::bound(&text_of(&it.content), cap, &file).map_err(|e| {
+                format!(
+                    "the ledger cannot keep the result of {name}: {}: {e}",
+                    file.display()
+                )
+            })?;
+            newest = Some(json!({ "name": name, "input": it.input, "result": text.text }));
+        }
         let older = || {
             earlier.and_then(|l| {
                 l["latest"]
@@ -307,7 +344,7 @@ pub fn ledger(
         .map(|k| format!("- {}: {} (output: {})", k.id, k.command, k.output.display()))
         .collect();
     if files.is_empty() && latest.is_empty() && running.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut text = String::from("Kept word for word at this compaction (not summarized):");
     if !files.is_empty() {
@@ -326,7 +363,7 @@ pub fn ledger(
             l["input"]
         ));
     }
-    Some((json!({ "files": files, "latest": latest }), text))
+    Ok(Some((json!({ "files": files, "latest": latest }), text)))
 }
 
 /// The state delta at a turn's start: files changed by someone else,
@@ -450,7 +487,7 @@ impl Repeats {
             };
             let full = match full {
                 Some((at, id)) => {
-                    r["content"] = json!([{ "type": "text", "text": format!("Unchanged. You already have this result (step {at}).") }]);
+                    r["content"] = json!([{ "type": "text", "text": format!("{REPEATED}{at}).") }]);
                     (at, id)
                 }
                 None => (step, c.id.clone()),

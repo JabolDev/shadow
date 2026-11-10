@@ -121,7 +121,16 @@ async fn summarize(
     };
     let (_never_stopped, mut stop) = watch::channel(false);
     let (summary, _) = summary(&ask, wire.messages.clone(), prompt.as_deref(), &mut stop).await?;
-    push(&mut wire, &summary, session, &keep, cap.unwrap_or(30_000));
+    let cap = cap.unwrap_or(30_000);
+    let (msg, ledger) = message(
+        &wire.messages,
+        wire.ledger.as_ref(),
+        &summary,
+        session,
+        &keep,
+        cap,
+    )?;
+    wire.push_compaction(&msg, ledger);
     wire.commit()
         .map_err(|e| format!("cannot write the wire log: {e}"))?;
     let mut versions = Versions::load(&session.versions_path());
@@ -187,16 +196,23 @@ pub async fn summary(
     Ok((summary, reply.usage))
 }
 
-/// Logs the compaction marker: the summary message, with the ledger as a
-/// second text block, and the ledger itself (carried into the next one).
-pub fn push(wire: &mut Wire, summary: &str, session: &Session, keep: &[String], cap: usize) {
+/// The compaction marker's summary message (the ledger as a second text
+/// block) and the ledger itself (carried into the next one), for a
+/// compaction of `messages`. Err when the ledger cannot be made: the
+/// compaction fails.
+pub fn message(
+    messages: &[String],
+    earlier: Option<&Value>,
+    summary: &str,
+    session: &Session,
+    keep: &[String],
+    cap: usize,
+) -> Result<(Value, Option<Value>), String> {
     let mut content = vec![json!({ "type": "text", "text": format!("{LEAD}{summary}") })];
-    let ledger = context::ledger(&wire.messages, wire.ledger.as_ref(), session, keep, cap);
+    let ledger = context::ledger(messages, earlier, session, keep, cap)?;
     if let Some((_, text)) = &ledger {
         content.push(json!({ "type": "text", "text": text }));
     }
-    wire.push_compaction(
-        &json!({ "role": "user", "content": content }),
-        ledger.map(|l| l.0),
-    );
+    let msg = json!({ "role": "user", "content": content });
+    Ok((msg, ledger.map(|l| l.0)))
 }

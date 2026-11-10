@@ -779,3 +779,280 @@ fn c11_sixty_reads_of_one_file_return_its_text_once() {
     let chars: usize = last.iter().map(|m| m.chars().count()).sum();
     assert!(chars / 4 < 16_000, "{} tokens", chars / 4);
 }
+
+/// The results of a request's tool calls, by call id.
+fn results_by_id(body: &Value) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for m in body["messages"].as_array().unwrap() {
+        for b in m["content"].as_array().into_iter().flatten() {
+            if b["type"] == "tool_result" {
+                out.insert(b["tool_use_id"].as_str().unwrap().to_string(), text(b));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn f1_a_ledger_that_cannot_be_written_fails_the_compaction() {
+    let long = format!("BOARD-{}", "row of the board\n".repeat(70));
+    let rules = vec![json!({ "method": "tool.call", "reply": { "content": long } })];
+    let mut e = Env::new("f1", vec![], rules);
+    let tools = json!({ "limits": { "result_cap_chars": 300 }, "host_tools": [{ "name": "board", "input_schema": { "type": "object" }, "keep_latest": true }] });
+    // session.compact: an error, and the log is left as it was
+    e.fake.push([
+        calls(json!([{ "name": "board", "input": { "page": 7 } }])),
+        json!({ "text": "seen" }),
+        json!({ "match": "Write a summary", "text": "SUMMARY-F1", "repeat": true }),
+    ]);
+    let t = e.start("f1", "look", tools.clone());
+    assert_eq!(e.end(&t)["reason"], "done");
+    let scratch = e.data.join("sessions/f1/scratch");
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::write(&scratch, "a file where the folder should be").unwrap();
+    let before = e.wire("f1");
+    let r = e.host.call(
+        "session.compact",
+        json!({ "session": "f1", "model": "m", "endpoint": { "url": e.fake.url() } }),
+    );
+    assert_eq!(r["error"]["code"], "compaction_failed", "{r}");
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("the ledger cannot keep the result of board: "),
+        "{r}"
+    );
+    assert_eq!(e.wire("f1"), before, "the log is unchanged");
+    // auto-compaction: counts as failed, the turn goes on, the log keeps no marker
+    let dir = e.data.join("sessions/f1b");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("scratch"), "not a folder").unwrap();
+    e.fake.push([
+        calls(json!([{ "name": "board", "input": { "page": 8 } }])),
+        json!({ "tool_calls": [{ "name": "Glob", "input": { "pattern": "*.f1" } }], "usage": { "input_tokens": 950 } }),
+        json!({ "text": "went on" }),
+    ]);
+    let mut p = tools;
+    p["limits"]["context_tokens"] = json!(1000);
+    p["auto_compact"] = json!(true);
+    let t = e.start("f1b", "work", p);
+    let end = e.end(&t);
+    assert_eq!(end["reason"], "done", "{end}");
+    let states: Vec<Value> = e
+        .host
+        .lines()
+        .into_iter()
+        .filter(|l| l["method"] == "compaction" && l["params"]["turn"] == t)
+        .map(|l| l["params"]["state"].clone())
+        .collect();
+    assert_eq!(states, ["start", "failed"]);
+    assert!(!e.wire("f1b").contains("\"kind\":\"compaction\""));
+    let b = e.fake.bodies();
+    let n = b.len();
+    assert!(
+        extends(&b[n - 3], &b[n - 1]),
+        "the turn went on from the same context"
+    );
+}
+
+#[test]
+fn f2_the_ledger_keeps_the_real_result_the_loop_breaker_replaced() {
+    let rules = vec![
+        json!({ "method": "tool.call", "match": { "call": { "input": { "q": "a" } } }, "reply": { "content": [{ "type": "text", "text": "A-REAL\nsecond line" }] } }),
+        json!({ "method": "tool.call", "match": { "call": { "input": { "q": "b" } } }, "reply": { "content": "B-REAL" } }),
+    ];
+    let mut e = Env::new("f2", vec![], rules);
+    let a = json!({ "name": "status", "input": { "q": "a" } });
+    e.fake.push([
+        calls(json!([a])),
+        calls(json!([a])),
+        calls(json!([a, { "name": "status", "input": { "q": "b" } }])),
+        calls(json!([a])),
+        json!({ "text": "watched" }),
+    ]);
+    let tools = json!({ "host_tools": [{ "name": "status", "input_schema": { "type": "object" }, "keep_latest": true }] });
+    let t = e.start("f2", "watch", tools.clone());
+    assert_eq!(e.end(&t)["reason"], "done");
+    let last = e.fake.bodies().last().unwrap().clone();
+    let shown: Vec<String> = results_by_id(&last).into_values().collect();
+    assert_eq!(
+        shown
+            .iter()
+            .filter(|r| r.starts_with("Unchanged. You already have this result"))
+            .count(),
+        2,
+        "{shown:?}"
+    );
+    // after a restart the real result comes from the log alone
+    e.restart();
+    e.fake.push([
+        json!({ "match": "next", "text": "back" }),
+        json!({ "match": "Write a summary", "text": "SUMMARY-F2" }),
+    ]);
+    let t = e.start("f2", "next", tools);
+    assert_eq!(e.end(&t)["reason"], "done");
+    let r = e.host.call(
+        "session.compact",
+        json!({ "session": "f2", "model": "m", "endpoint": { "url": e.fake.url() } }),
+    );
+    assert_eq!(r["result"]["messages_after"], 1, "{r}");
+    let marker: Value = e
+        .wire("f2")
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .find(|l| l["kind"] == "compaction")
+        .unwrap();
+    assert_eq!(
+        marker["ledger"]["latest"],
+        json!([{ "name": "status", "input": { "q": "a" }, "result": "A-REAL\nsecond line" }])
+    );
+    assert!(
+        marker["message"]["content"][1]["text"]
+            .as_str()
+            .unwrap()
+            .ends_with("Input: {\"q\":\"a\"}\nResult:\nA-REAL\nsecond line")
+    );
+}
+
+#[test]
+fn f3_branches_start_from_the_version_table_before_their_step() {
+    // the parent's Read runs first; both branches' checks are held 300 ms
+    let rules = vec![
+        json!({ "method": "tool.check", "match": { "call": { "name": "Branch" } }, "reply": { "decision": "allow" }, "delay_ms": 300 }),
+    ];
+    let mut e = Env::new("f3", vec![], rules);
+    write(
+        &e.work.join("f.txt"),
+        "line one\nLINE-TWO here\nline three\nline four\n",
+    );
+    let part = json!({ "file_path": "f.txt", "offset": 2, "limit": 2 });
+    e.fake.push([
+        json!({ "match": "go fork", "tool_calls": [
+            { "id": "pr", "name": "Read", "input": { "file_path": "f.txt" } },
+            { "id": "k1", "name": "Branch", "input": { "task": "FORK-ONE" } },
+            { "id": "k2", "name": "Branch", "input": { "task": "FORK-TWO" } },
+        ] }),
+        // each branch looks around first, then reads part of the file
+        json!({ "match": "FORK-", "tool_calls": [{ "name": "Glob", "input": { "pattern": "*.zz" } }], "repeat": true }),
+        json!({ "match": "No files found", "tool_calls": [{ "name": "Read", "input": part }], "repeat": true }),
+        json!({ "match": "LINE-TWO", "text": "fork answer", "repeat": true }),
+    ]);
+    let t = e.start("f3", "go fork", json!({}));
+    let end = e.end(&t);
+    assert_eq!(end["reason"], "done", "{end}");
+    let lines = e.host.lines();
+    let at = |m: &str, id: &str| {
+        lines
+            .iter()
+            .position(|l| {
+                l["method"] == m
+                    && (l["params"]["call"]["id"] == id || l["params"]["call_id"] == id)
+            })
+            .unwrap()
+    };
+    assert!(
+        at("tool.end", "pr") < at("tool.start", "k1"),
+        "the parent's Read ran first"
+    );
+    let reads: Vec<(Value, String)> = lines
+        .iter()
+        .filter(|l| {
+            l["method"] == "tool.end"
+                && l["params"]["name"] == "Read"
+                && l["params"].get("branch").is_some()
+        })
+        .map(|l| (l["params"]["branch"].clone(), text(&l["params"])))
+        .collect();
+    assert_eq!(reads.len(), 2, "{reads:?}");
+    for (_, r) in &reads {
+        assert_eq!(
+            r,
+            "     2\tLINE-TWO here\n     3\tline three\n\n(Lines 2–3 of 4. Use offset and limit to read other lines.)"
+        );
+    }
+}
+
+#[test]
+fn f4_one_line_reads_never_take_the_newest_view_through_a_fade_and_a_cold_turn() {
+    let mut e = env_ttl("f4", 1500, vec![]);
+    write(&e.work.join("same.txt"), &lines(150, 30, "S"));
+    for i in 1..=14 {
+        write(
+            &e.work.join(format!("b{i}.txt")),
+            &lines(100, 60, &format!("b{i}-")),
+        );
+        let tokens = if i < 14 { 1000 * i } else { 25_000 };
+        e.fake.push([json!({ "tool_calls": [
+            { "id": format!("r{i}"), "name": "Read", "input": { "file_path": "same.txt" } },
+            { "id": format!("c{i}"), "name": "Bash", "input": { "command": format!("cat b{i}.txt") } },
+        ], "usage": { "input_tokens": tokens } })]);
+    }
+    e.fake.push([json!({ "text": "done" })]);
+    let p = json!({ "limits": { "context_tokens": 40000, "max_steps": 30 } });
+    let t = e.start("f4", "read", p.clone());
+    assert_eq!(e.end(&t)["reason"], "done");
+    let marks = fades(&e.wire("f4"));
+    assert_eq!(marks.len(), 1, "a 60% fade happened");
+    let faded: Vec<&String> = marks[0]["stubs"].as_object().unwrap().keys().collect();
+    assert_eq!(faded, ["c1", "c2", "c3", "c4"]);
+    let res = results_by_id(e.fake.bodies().last().unwrap());
+    assert_eq!(res["r1"].lines().count(), 150, "the only full view stays");
+    assert!(
+        res["r4"].starts_with("Unchanged. You already have this result"),
+        "{}",
+        res["r4"]
+    );
+    // a cold turn fades every candidate, still never that view
+    std::thread::sleep(Duration::from_millis(1600));
+    e.fake.push([json!({ "text": "cold" })]);
+    let t = e.start("f4", "again", p);
+    assert_eq!(e.end(&t)["reason"], "done");
+    let marks = fades(&e.wire("f4"));
+    assert_eq!(marks.len(), 2);
+    assert!(marks.iter().all(|m| {
+        m["stubs"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .all(|k| k.starts_with('c'))
+    }));
+    let res = results_by_id(e.fake.bodies().last().unwrap());
+    assert_eq!(res["r1"].lines().count(), 150);
+}
+
+#[test]
+fn f5_at_60_percent_a_fade_waits_until_the_candidates_free_10_percent() {
+    let mut e = Env::new("f5", vec![], vec![]);
+    for i in 1..=16 {
+        write(
+            &e.work.join(format!("m{i}.txt")),
+            &lines(60, 60, &format!("m{i}-")),
+        );
+        let tokens = if i == 1 { 2000 } else { 25_000 };
+        e.fake.push([json!({ "tool_calls": [{ "id": format!("m{i}"), "name": "Bash", "input": { "command": format!("cat m{i}.txt") } }], "usage": { "input_tokens": tokens } })]);
+    }
+    e.fake
+        .push([json!({ "text": "done", "usage": { "input_tokens": 25_000 } })]);
+    let t = e.start(
+        "f5",
+        "go",
+        json!({ "limits": { "context_tokens": 40000, "max_steps": 30 } }),
+    );
+    assert_eq!(e.end(&t)["reason"], "done");
+    // 62.5% from step 2 on. Each result frees about 870 tokens: 4 candidates
+    // (boundary 14) are under 10% of the window, 5 (boundary 15) are over.
+    let b = e.fake.bodies();
+    let rewrites: Vec<usize> = (1..b.len())
+        .filter(|&i| !extends(&b[i - 1], &b[i]))
+        .collect();
+    assert_eq!(
+        rewrites,
+        [15],
+        "one fade, after step 15; none at 2-14 or at 16"
+    );
+    let marks = fades(&e.wire("f5"));
+    assert_eq!(marks.len(), 1);
+    let ids: Vec<&String> = marks[0]["stubs"].as_object().unwrap().keys().collect();
+    assert_eq!(ids, ["m1", "m2", "m3", "m4", "m5"]);
+}

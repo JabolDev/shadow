@@ -149,12 +149,16 @@ the chat's assistant messages since the last compaction.
 - **Size.** The context's size is what the model last reported (input,
   cache-read and cache-write tokens plus the output tokens of its message),
   plus or minus the characters changed since then at 4 per token.
-- **Fade.** A candidate is a tool result older than the last 10 steps, of at
-  least 2,000 characters, not yet faded, not the newest Read of its file that
-  shows the file (an `Unchanged since` answer does not count), and not the
-  newest call of a `keep_latest` host tool. Order: superseded results first
-  (a Read of a file read again later, a call repeated later with the same
-  tool and input), then the rest; oldest first, larger before smaller. A
+- **Fade.** A one-line answer (`Unchanged since step …` or the loop
+  breaker's `Unchanged. You already have this result (step N).`) holds no
+  text: it is never a view of a file and supersedes nothing. A candidate is a
+  tool result older than the last 10 steps, of at least 2,000 characters, not
+  yet faded, not the newest Read of its file that shows the file, and not the
+  real result of a `keep_latest` host tool's newest call (when the loop
+  breaker answered that call, the result it points to). Order: superseded
+  results first (a Read of a file read again later, a call repeated later
+  with the same tool and input and a real result), then the rest; oldest
+  first, larger before smaller. A
   faded result is sent as one line:
   `[Faded to save context: <tool and main argument> returned <N lines (M characters) | an image> at step N. Full output: <overflow file>. Run it again if you need it.]`
   (the overflow file only when there is one). Its Read lines are no longer
@@ -164,10 +168,12 @@ the chat's assistant messages since the last compaction.
     passed since the chat's last model call (always with cache `off`): every
     candidate, before the first model call;
   - **60%**: at a step boundary when the context is at 60% of
-    `context_tokens` or more: candidates in order until it is at 40%, or
-    none is left. When that leaves it at 60% or more, the next 60% fade
-    waits until a boundary finds it under 60% (or the next turn), so fades
-    never come a few at a time. A cold wake counts as such a fade.
+    `context_tokens` or more, and only if all candidates together would
+    free at least 10% of `context_tokens` (by this size estimate):
+    candidates in order until it is at 40%, or none is left. When they would
+    free less, nothing fades at that boundary and the next one asks again.
+    No memory of earlier boundaries: two fades always free 10% or more
+    each, so there is never a small fade at every step.
 - **State delta.** At `turn.start`, the user's message starts with one text
   block `What changed since the last model call:` and one line each for: a
   file in the version table that changed since the model saw it (lines
@@ -199,7 +205,8 @@ native tool).
   it, Edit, Write and Branch calls are not run: `Not available in a branch.`
   (no `tool.check`). Other calls run as in the turn (`tool.check`,
   `tool.call`, `tool.end` carry `branch`). Its Reads use a copy of the
-  version table.
+  version table as it was before any call of the current step ran (the
+  same point as its messages).
 - Nothing of it is logged; the turn's log gains the call and its result. Its
   usage is added to the turn's `usage`; `steps` counts the turn's steps only.
 - Its first message without a tool call is the answer. Errors:
@@ -265,8 +272,13 @@ message, starting `Kept word for word at this compaction (not summarized):`.
 It lists every file the chat created or changed with Write or Edit (as the
 call named it, with the files of earlier ledgers), every background command
 still running (id, command, output file), and for each `keep_latest` host
-tool its newest call's input and result (from an earlier ledger when it was
-not called since), within the result cap. `session.compact` uses the latest
+tool its newest call's input and real result (when the loop breaker
+answered that call, the result it points to; from an earlier ledger when
+the tool was not called since), within the result cap with the usual
+overflow file. When the ledger cannot be made (an overflow file cannot be
+written), the compaction fails: `session.compact` answers
+`compaction_failed`, an auto-compaction counts as failed, and the log is
+left unchanged. `session.compact` uses the latest
 turn's `keep_latest` tools and result cap (none and 30000 after a restart).
 
 ## Test only

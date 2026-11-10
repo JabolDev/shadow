@@ -314,7 +314,9 @@ fn the_ledger_keeps_files_commands_and_the_newest_kept_call() {
         "board".to_string(),
         "never".to_string(),
     ];
-    let (l, text) = ledger(&w.messages, Some(&earlier), &s, &keep, 30_000).unwrap();
+    let (l, text) = ledger(&w.messages, Some(&earlier), &s, &keep, 30_000)
+        .unwrap()
+        .unwrap();
     assert_eq!(l["files"], json!(["/w/old.txt", "/w/new.txt", "/w/a.rs"]));
     assert_eq!(
         l["latest"],
@@ -326,5 +328,44 @@ fn the_ledger_keeps_files_commands_and_the_newest_kept_call() {
     );
     s.lock().tasks.clear();
     let empty = chat(&tmp("ledger-empty"), &[]);
-    assert!(ledger(&empty.messages, None, &s, &[], 30_000).is_none());
+    assert!(
+        ledger(&empty.messages, None, &s, &[], 30_000)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn one_line_answers_supersede_nothing_and_the_kept_result_stays() {
+    let dir = tmp("kept");
+    let big = |c: char| c.to_string().repeat(3000);
+    let short = |n: u64| format!("{REPEATED}{n}).");
+    let status = json!({ "q": 1 });
+    let mut steps = vec![
+        vec![
+            ("k1", "status", status.clone(), big('a')),
+            ("b1", "Bash", json!({ "command": "make" }), big('m')),
+        ],
+        vec![("k2", "status", status.clone(), big('a'))],
+        vec![
+            ("k3", "status", status.clone(), short(2)),
+            ("b3", "Bash", json!({ "command": "make" }), short(1)),
+        ],
+        vec![("k4", "status", status.clone(), short(2))],
+    ];
+    for i in 5..=15 {
+        steps.push(filler(i));
+    }
+    let w = chat(&dir, &steps);
+    let keep = vec!["status".to_string()];
+    let f = fade(&w, 0, Path::new("/w"), &dir, &keep, None);
+    // k1 is superseded by k2's real result; b1 by nothing (b3 is one line);
+    // k2 holds the newest call's real result and is never faded.
+    assert_eq!(f.stubs.keys().collect::<Vec<_>>(), ["k1", "b1"]);
+    let s = Session::new("k".into(), dir.clone());
+    let (l, _) = ledger(&w.messages, None, &s, &keep, 30_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(l["latest"][0]["result"], big('a'));
+    assert_eq!(l["latest"][0]["input"], status);
 }
