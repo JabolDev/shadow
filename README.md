@@ -12,7 +12,8 @@ Anthropic-format endpoint) with your own API key.
 ## Download
 
 Each release has a static x86_64 Linux binary,
-`shadow-x86_64-unknown-linux-musl`, and its SHA-256 next to it:
+`shadow-x86_64-unknown-linux-musl`, its SHA-256, the license files, and the
+third-party notices (`THIRD-PARTY-LICENSES.txt`) next to it:
 
 ```sh
 sha256sum -c shadow-x86_64-unknown-linux-musl.sha256
@@ -130,3 +131,19 @@ Each chat lives in `<data dir>/sessions/<name>/`:
 
 The data dir is `~/.shadow` for `run` (or `--data-dir`). For `serve`, the host
 names it.
+
+## License
+
+Shadow is licensed under either of
+
+- the Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE)), or
+- the MIT license ([LICENSE-MIT](LICENSE-MIT)),
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in Shadow by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.
+
+The released binary contains third-party crates under their own permissive
+licenses; each release carries their notices in `THIRD-PARTY-LICENSES.txt`.

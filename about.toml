@@ -1,0 +1,22 @@
+# cargo-about: the third-party notices shipped with every release
+# (THIRD-PARTY-LICENSES.txt, built by .github/workflows/release.yml).
+# The licenses Shadow's dependencies may use, in order of preference.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "Unlicense",
+]
+# Only what goes into the released binary.
+targets = ["x86_64-unknown-linux-musl"]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+# Shadow itself (publish = false): its own license is LICENSE-MIT / LICENSE-APACHE.
+private = { ignore = true }
+# ring and rustls ship their license texts in a way cargo-about needs help with.
+workarounds = ["ring", "rustls"]
