@@ -1,0 +1,73 @@
+# Builds the static x86_64 Linux binary on every pull request, and publishes
+# it as a GitHub release on every tag `v<version>` (the version in Cargo.toml):
+#   shadow-x86_64-unknown-linux-musl          the binary
+#   shadow-x86_64-unknown-linux-musl.sha256   its SHA-256, `sha256sum` format
+name: release
+
+on:
+  pull_request:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # to publish the release (tags only)
+    env:
+      TARGET: x86_64-unknown-linux-musl
+      ASSET: shadow-x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: musl C toolchain (ring's C code)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Rust (the channel in rust-toolchain.toml)
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$channel" --profile minimal --target "$TARGET"
+          rustc --version
+
+      - name: The tag names the version in Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
+            exit 1
+          fi
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build
+        run: cargo build --release --locked --target "$TARGET"
+
+      - name: Package
+        run: |
+          mkdir dist
+          cp "target/$TARGET/release/shadow" "dist/$ASSET"
+          chmod 755 "dist/$ASSET"
+          (cd dist && sha256sum "$ASSET" > "$ASSET.sha256")
+          file "dist/$ASSET"
+          cat "dist/$ASSET.sha256"
+          "dist/$ASSET" tools > /dev/null # the binary starts and prints its tool list
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASSET }}
+          path: dist/
+          if-no-files-found: error
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "dist/$ASSET" "dist/$ASSET.sha256" \
+            --title "Shadow $GITHUB_REF_NAME" \
+            --notes "Static x86_64 Linux binary. Check it with: sha256sum -c $ASSET.sha256"

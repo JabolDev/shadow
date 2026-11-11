@@ -9,6 +9,19 @@ tools: Read, Write, Edit, Bash, TaskStop, Grep, Glob and Branch. It can run in t
 It calls Anthropic-format Messages APIs (Anthropic, OpenRouter, or any other
 Anthropic-format endpoint) with your own API key.
 
+## Download
+
+Each release has a static x86_64 Linux binary,
+`shadow-x86_64-unknown-linux-musl`, and its SHA-256 next to it:
+
+```sh
+sha256sum -c shadow-x86_64-unknown-linux-musl.sha256
+```
+
+Releases are built by `.github/workflows/release.yml` when a tag
+`v<version>` (the version in `Cargo.toml`) is pushed. Other platforms are not
+built yet.
+
 ## Build
 
 You need Rust 1.99 (`rust-toolchain.toml`).
